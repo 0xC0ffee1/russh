@@ -19,6 +19,7 @@ use aes::cipher::{BlockSizeUser, StreamCipherSeek};
 use byteorder::{BigEndian, ByteOrder};
 use chacha20::cipher::{KeyInit, KeyIvInit, StreamCipher};
 use chacha20::{ChaCha20Legacy, ChaCha20LegacyCore};
+use futures::lock::Mutex;
 use generic_array::typenum::{Unsigned, U16, U32, U8};
 use generic_array::GenericArray;
 use poly1305::Poly1305;

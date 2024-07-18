@@ -15,7 +15,7 @@ use crate::kex::EXTENSION_SUPPORT_AS_CLIENT;
 use crate::msg;
 use futures::StreamExt;
 
-pub(crate) type ChannelReadFuture<R> = Pin<Box<dyn Future<Output = Result<(usize, SshRead<ReadHalf<R>>, Arc<Mutex<SSHBuffer>>, Box<dyn OpeningKey + Send>), Error>> + Send>>;
+pub(crate) type ChannelReadFuture<R> = Pin<Box<dyn Future<Output = Result<(usize, SshRead<ReadHalf<R>>, Arc<Mutex<SSHBuffer>>, Arc<Mutex<Box<dyn OpeningKey + Send>>>), Error>> + Send>>;
 
 
 /// A connected server session. This type is unique to a client.
@@ -408,10 +408,6 @@ impl Session {
 
         let (stream_read, mut stream_write) = stream.split();
 
-        // Allow handing out references to the cipher
-        let mut opening_cipher = Box::new(clear::Key) as Box<dyn OpeningKey + Send>;
-        std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
-
         let keepalive_timer =
             future_or_pending(self.common.config.keepalive_interval, tokio::time::sleep);
         pin!(keepalive_timer);
@@ -420,7 +416,7 @@ impl Session {
             future_or_pending(self.common.config.inactivity_timeout, tokio::time::sleep);
         pin!(inactivity_timer);
 
-        let reading = start_reading(stream_read, self.common.read_buffer.clone(), opening_cipher);
+        let reading = start_reading(stream_read, self.common.read_buffer.clone(), self.common.cipher.remote_to_local.clone());
         pin!(reading);
         let mut is_reading = None;
         let mut is_channel_reading = None;
@@ -468,7 +464,6 @@ impl Session {
                             break;
                         } else {
                             self.common.received_data = true;
-                            std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
 
                             //Figure out a better way to do this, probably just do what the comment below says
                             let mut vec = vec![0; buf.len()];
@@ -479,7 +474,6 @@ impl Session {
                                 Ok(_) => {},
                                 Err(e) => return Err(e),
                             }
-                            std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
                         }
                     }
                     reading.set(start_reading(stream_read, buffer_guard.clone(), opening_cipher));
@@ -518,7 +512,6 @@ impl Session {
                             break;
                         } else {
                             self.common.received_data = true;
-                            std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
 
                             //Figure out a better way to do this, probably just do what the comment below says
                             let mut vec = vec![0; buf.len()];
@@ -529,7 +522,6 @@ impl Session {
                                 Ok(_) => {},
                                 Err(e) => return Err(e),
                             }
-                            std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
                         }
                     }
                     let new_future = start_reading(stream_read, buffer_guard.clone(), opening_cipher);
@@ -629,7 +621,7 @@ impl Session {
                 let channels: Vec<_> = enc.channels.keys().cloned().collect();
 
                 for id in channels {
-                    let _ = enc.flush_channel_test(&id, &self.common.config.as_ref().limits, &mut *self.common.cipher.local_to_remote, &mut self.common.write_buffer);
+                    let _ = enc.flush_channel_test(&id, &self.common.config.as_ref().limits, self.common.cipher.local_to_remote.clone(), &mut self.common.write_buffer);
                     if self.common.write_buffer.buffer.is_empty() {continue;}
                     log::info!(
                         "writing to CHANNEL stream: {:?} bytes",
@@ -732,7 +724,7 @@ impl Session {
         if let Some(ref mut enc) = self.common.encrypted {
             if enc.flush(
                 &self.common.config.as_ref().limits,
-                &mut *self.common.cipher.local_to_remote,
+                self.common.cipher.local_to_remote.clone(),
                 &mut self.common.write_buffer
             )? && enc.rekey.is_none()
             {
@@ -741,7 +733,7 @@ impl Session {
                     let mut kexinit = KexInit::initiate_rekey(exchange, &enc.session_id);
                     kexinit.server_write(
                         self.common.config.as_ref(),
-                        &mut *self.common.cipher.local_to_remote,
+                        self.common.cipher.local_to_remote.clone(),
                         &mut self.common.write_buffer,
                     )?;
                     enc.rekey = Some(Kex::Init(kexinit))

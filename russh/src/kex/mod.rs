@@ -23,6 +23,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use curve25519::Curve25519KexType;
 use dh::{
@@ -33,6 +34,7 @@ use ecdh_nistp::{EcdhNistP256KexType, EcdhNistP384KexType, EcdhNistP521KexType};
 use once_cell::sync::Lazy;
 use russh_cryptovec::CryptoVec;
 use russh_keys::encoding::Encoding;
+use tokio::sync::Mutex;
 
 use crate::cipher;
 use crate::cipher::CIPHERS;
@@ -276,8 +278,8 @@ pub(crate) fn compute_keys<D: Digest>(
                         cipher.make_opening_key(&key, &nonce, &mac, *remote_to_local_mac);
 
                     Ok(super::cipher::CipherPair {
-                        local_to_remote,
-                        remote_to_local,
+                        local_to_remote: Arc::new(Mutex::new(local_to_remote)),
+                        remote_to_local: Arc::new(Mutex::new(remote_to_local)),
                     })
                 })
             })

@@ -54,7 +54,7 @@ impl Session {
             if let Some(Kex::Init(kexinit)) = enc.rekey.take() {
                 enc.rekey = Some(kexinit.server_parse(
                     self.common.config.as_ref(),
-                    &mut *self.common.cipher.local_to_remote,
+                    self.common.cipher.local_to_remote.clone(),
                     buf,
                     &mut self.common.write_buffer,
                 )?);
@@ -70,7 +70,7 @@ impl Session {
                 );
                 enc.rekey = Some(kexinit.server_parse(
                     self.common.config.as_ref(),
-                    &mut *self.common.cipher.local_to_remote,
+                    self.common.cipher.local_to_remote.clone(),
                     buf,
                     &mut self.common.write_buffer,
                 )?);
@@ -86,7 +86,7 @@ impl Session {
             Some(Kex::Dh(kexdh)) => {
                 enc.rekey = Some(kexdh.parse(
                     self.common.config.as_ref(),
-                    &mut *self.common.cipher.local_to_remote,
+                    self.common.cipher.local_to_remote.clone(),
                     buf,
                     &mut self.common.write_buffer,
                 )?);
@@ -1175,10 +1175,7 @@ impl Session {
                     _ = sub_stream.write(b"ack").await;
                     let (read,write) = SshRead::new(sub_stream).split();
 
-                    let mut opening_cipher = Box::new(clear::Key) as Box<dyn OpeningKey + Send>;
-                    std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
-
-                    let r = start_reading(read, self.common.read_buffer.clone(), opening_cipher);
+                    let r = start_reading(read, self.common.read_buffer.clone(), self.common.cipher.remote_to_local.clone());
                     let r = Box::pin(r);
                     self.channel_reads.push(r);
                     self.channel_streams.insert(sender_channel.clone(), write);

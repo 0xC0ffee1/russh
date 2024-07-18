@@ -18,7 +18,7 @@ impl KexInit {
     pub fn server_parse(
         mut self,
         config: &Config,
-        cipher: &mut dyn SealingKey,
+        cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
         buf: &[u8],
         write_buffer: &mut SSHBuffer,
     ) -> Result<Kex, Error> {
@@ -57,7 +57,7 @@ impl KexInit {
     pub fn server_write(
         &mut self,
         config: &Config,
-        cipher: &mut dyn SealingKey,
+        cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
         write_buffer: &mut SSHBuffer,
     ) -> Result<(), Error> {
         self.exchange.server_kex_init.clear();
@@ -68,7 +68,7 @@ impl KexInit {
         )?;
         debug!("server kex init: {:?}", &self.exchange.server_kex_init[..]);
         self.sent = true;
-        cipher.write(&self.exchange.server_kex_init, write_buffer);
+        cipher.blocking_lock().write(&self.exchange.server_kex_init, write_buffer);
         Ok(())
     }
 }
@@ -77,7 +77,7 @@ impl KexDh {
     pub fn parse(
         mut self,
         config: &Config,
-        cipher: &mut dyn SealingKey,
+        cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
         buf: &[u8],
         write_buffer: &mut SSHBuffer,
     ) -> Result<Kex, Error> {
@@ -129,6 +129,7 @@ impl KexDh {
                 debug!("hash: {:?}", hash);
                 debug!("key: {:?}", config.keys[kexdhdone.key]);
                 config.keys[kexdhdone.key].add_signature(&mut buffer, &hash)?;
+                let mut cipher = cipher.blocking_lock();
                 cipher.write(&buffer, write_buffer);
                 cipher.write(&[msg::NEWKEYS], write_buffer);
                 Ok(hash)

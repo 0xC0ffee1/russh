@@ -153,8 +153,8 @@ impl TryFrom<&str> for Name {
 }
 
 pub(crate) struct CipherPair {
-    pub local_to_remote: Box<dyn SealingKey + Send>,
-    pub remote_to_local: Box<dyn OpeningKey + Send>,
+    pub local_to_remote: Arc<Mutex<Box<dyn SealingKey + Send>>>,
+    pub remote_to_local: Arc<Mutex<Box<dyn OpeningKey + Send>>>,
 }
 
 impl Debug for CipherPair {
@@ -229,7 +229,7 @@ pub(crate) trait SealingKey {
 pub(crate) async fn read<'a, R: AsyncRead + Unpin>(
     stream: &'a mut R,
     buffer_guard: Arc<Mutex<SSHBuffer>>,
-    cipher: &'a mut (dyn OpeningKey + Send),
+    cipher_guard: Arc<Mutex<Box<dyn OpeningKey + Send>>>,
 ) -> Result<usize, Error> {
     let mut buffer_len: usize = {
         let mut buffer = buffer_guard.lock().await;
@@ -238,7 +238,10 @@ pub(crate) async fn read<'a, R: AsyncRead + Unpin>(
     };
 
     if buffer_len == 0 {
-        let mut len = vec![0; cipher.packet_length_to_read_for_block_length()];
+        let mut len = {
+            let cipher = cipher_guard.lock().await;
+            vec![0; cipher.packet_length_to_read_for_block_length()]
+        };
 
         stream.read_exact(&mut len).await?;
 
@@ -251,6 +254,7 @@ pub(crate) async fn read<'a, R: AsyncRead + Unpin>(
             buffer.buffer.clear();
             buffer.buffer.extend(&len);
             debug!("reading, seqn = {:?}", seqn);
+            let cipher = cipher_guard.lock().await;
             let len = cipher.decrypt_packet_length(seqn, &len);
             buffer.len = BigEndian::read_u32(&len) as usize + cipher.tag_len();
             debug!("reading, clear len = {:?}", buffer.len);
@@ -265,11 +269,21 @@ pub(crate) async fn read<'a, R: AsyncRead + Unpin>(
     
     debug!("read_exact {:?}", buffer.len + 4);
     #[allow(clippy::indexing_slicing)] // length checked
+
+    let packet_len = {
+        let cipher = cipher_guard.lock().await;
+        cipher.packet_length_to_read_for_block_length()
+    };
+
     stream
-        .read_exact(&mut buffer.buffer[cipher.packet_length_to_read_for_block_length()..])
+        .read_exact(&mut buffer.buffer[packet_len..])
         .await?;
+
     debug!("read_exact done");
     let seqn = buffer.seqn.0;
+
+    let mut cipher = cipher_guard.lock().await;
+
     let ciphertext_len = buffer.buffer.len() - cipher.tag_len();
     let (ciphertext, tag) = buffer.buffer.split_at_mut(ciphertext_len);
     let plaintext = cipher.open(seqn, ciphertext, tag)?;

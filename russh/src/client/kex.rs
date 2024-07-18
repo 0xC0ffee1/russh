@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use log::{debug, trace};
+use tokio::sync::Mutex;
 
 use crate::cipher::SealingKey;
 use crate::client::Config;
@@ -12,7 +15,7 @@ impl KexInit {
     pub fn client_parse(
         mut self,
         config: &Config,
-        cipher: &mut dyn SealingKey,
+        cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
         buf: &[u8],
         write_buffer: &mut SSHBuffer,
     ) -> Result<KexDhDone, crate::Error> {
@@ -25,8 +28,9 @@ impl KexInit {
         };
         debug!("algo = {:?}", algo);
         debug!("write = {:?}", &write_buffer.buffer[..]);
+
         if !self.sent {
-            self.client_write(config, cipher, write_buffer)?
+            self.client_write(config, cipher.clone(), write_buffer)?
         }
 
         // This function is called from the public API.
@@ -49,7 +53,7 @@ impl KexInit {
         )?;
 
         #[allow(clippy::indexing_slicing)] // length checked
-        cipher.write(&self.exchange.client_kex_init[i0..], write_buffer);
+        cipher.blocking_lock().write(&self.exchange.client_kex_init[i0..], write_buffer);
         self.exchange.client_kex_init.resize(i0);
 
         debug!("moving to kexdhdone, exchange = {:?}", self.exchange);
@@ -65,13 +69,13 @@ impl KexInit {
     pub fn client_write(
         &mut self,
         config: &Config,
-        cipher: &mut dyn SealingKey,
+        cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
         write_buffer: &mut SSHBuffer,
     ) -> Result<(), crate::Error> {
         self.exchange.client_kex_init.clear();
         negotiation::write_kex(&config.preferred, &mut self.exchange.client_kex_init, None)?;
         self.sent = true;
-        cipher.write(&self.exchange.client_kex_init, write_buffer);
+        cipher.blocking_lock().write(&self.exchange.client_kex_init, write_buffer);
         Ok(())
     }
 }

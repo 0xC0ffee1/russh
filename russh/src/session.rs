@@ -409,7 +409,7 @@ impl Encrypted {
         &mut self,
         id: &ChannelId,
         limits: &Limits,
-        cipher: &mut dyn SealingKey,
+        cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
         write_buffer: &mut SSHBuffer
     ) -> Result<bool, crate::Error> {
         // Initialize the result to true
@@ -431,7 +431,7 @@ impl Encrypted {
 
             #[allow(clippy::indexing_slicing)]
             let packet = self.compress.compress(to_write, &mut writer.compress_buffer)?;
-            cipher.write(packet, write_buffer);
+            cipher.blocking_lock().write(packet, write_buffer);
             writer.write_cursor += 4 + len;
         }
 
@@ -456,7 +456,7 @@ impl Encrypted {
     pub fn flush(
         &mut self,
         limits: &Limits,
-        cipher: &mut dyn SealingKey,
+        cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
         write_buffer: &mut SSHBuffer,
     ) -> Result<bool, crate::Error> {
         // If there are pending packets (and we've not started to rekey), flush them.
@@ -473,7 +473,7 @@ impl Encrypted {
                 let packet = self
                     .compress
                     .compress(to_write, &mut self.main_writer.compress_buffer)?;
-                cipher.write(packet, write_buffer);
+                cipher.blocking_lock().write(packet, write_buffer);
                 self.main_writer.write_cursor += 4 + len
             }
         }

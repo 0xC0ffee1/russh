@@ -84,7 +84,7 @@ impl Session {
 
                     let dhdone = kexinit.client_parse(
                         self.common.config.as_ref(),
-                        &mut *self.common.cipher.local_to_remote,
+                        self.common.cipher.local_to_remote.clone(),
                         buf,
                         &mut self.common.write_buffer,
                     )?;
@@ -114,6 +114,8 @@ impl Session {
                         self.common
                             .cipher
                             .local_to_remote
+                            .lock()
+                            .await
                             .write(&[msg::NEWKEYS], &mut self.common.write_buffer);
                         self.flush()?;
                         self.common.maybe_reset_seqn();
@@ -444,10 +446,7 @@ impl Session {
 
                     let (read,write) = SshRead::new(stream).split();
 
-                    let mut opening_cipher = Box::new(clear::Key) as Box<dyn OpeningKey + Send>;
-                    std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
-
-                    let r = start_reading(read, self.common.read_buffer.clone(), opening_cipher);
+                    let r = start_reading(read, self.common.read_buffer.clone(), self.common.cipher.remote_to_local.clone());
                     let r = Box::pin(r);
                     self.channel_reads.push(r);
                     self.channel_streams.insert(local_id.clone(), write);
@@ -942,6 +941,7 @@ impl Session {
                         self.common
                             .cipher
                             .local_to_remote
+                            .blocking_lock()
                             .write(p, &mut self.common.write_buffer);
                         *sent = true
                     }

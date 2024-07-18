@@ -625,10 +625,10 @@ thread_local! {
 async fn start_reading<R: AsyncRead + Unpin>(
     mut stream_read: R,
     mut buffer: Arc<Mutex<SSHBuffer>>,
-    mut cipher: Box<dyn OpeningKey + Send>,
-) -> Result<(usize, R, Arc<Mutex<SSHBuffer>>, Box<dyn OpeningKey + Send>), Error> {
+    mut cipher: Arc<Mutex<Box<dyn OpeningKey + Send>>>,
+) -> Result<(usize, R, Arc<Mutex<SSHBuffer>>, Arc<Mutex<Box<dyn OpeningKey + Send>>>), Error> {
     
-    let n = cipher::read(&mut stream_read, buffer.clone(), &mut *cipher).await?;
+    let n = cipher::read(&mut stream_read, buffer.clone(), cipher.clone()).await?;
     Ok((n, stream_read, buffer, cipher))
 }
 
@@ -723,13 +723,13 @@ async fn read_ssh_id<R: AsyncRead + Unpin>(
         session_id: None,
     };
     let mut cipher = CipherPair {
-        local_to_remote: Box::new(clear::Key),
-        remote_to_local: Box::new(clear::Key),
+        local_to_remote: Arc::new(Mutex::new(Box::new(clear::Key))),
+        remote_to_local: Arc::new(Mutex::new(Box::new(clear::Key))),
     };
     let mut write_buffer = SSHBuffer::new();
     kexinit.server_write(
         config.as_ref(),
-        &mut *cipher.local_to_remote,
+        cipher.local_to_remote.clone(),
         &mut write_buffer,
     )?;
     Ok(CommonSession {
@@ -783,7 +783,7 @@ async fn reply<H: Handler + Send>(
                 if kexinit.algo.is_some() || buf.first() == Some(&msg::KEXINIT) {
                     session.common.kex = Some(kexinit.server_parse(
                         session.common.config.as_ref(),
-                        &mut *session.common.cipher.local_to_remote,
+                        session.common.cipher.local_to_remote.clone(),
                         buf,
                         &mut session.common.write_buffer,
                     )?);
@@ -805,7 +805,7 @@ async fn reply<H: Handler + Send>(
             Some(Kex::Dh(kexdh)) => {
                 session.common.kex = Some(kexdh.parse(
                     session.common.config.as_ref(),
-                    &mut *session.common.cipher.local_to_remote,
+                    session.common.cipher.local_to_remote.clone(),
                     buf,
                     &mut session.common.write_buffer,
                 )?);
