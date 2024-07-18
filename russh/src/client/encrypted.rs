@@ -20,12 +20,16 @@ use log::{debug, error, info, trace, warn};
 use russh_cryptovec::CryptoVec;
 use russh_keys::encoding::{Encoding, Reader};
 use russh_keys::key::parse_public_key;
+use tokio::io::AsyncReadExt;
 
-use crate::client::{Handler, Msg, Prompt, Reply, Session};
+use crate::cipher::{clear, OpeningKey};
+use crate::client::{start_reading, Handler, Msg, Prompt, Reply, Session};
 use crate::key::PubKey;
 use crate::negotiation::{Named, Select};
 use crate::parsing::{ChannelOpenConfirmation, ChannelType, OpenChannelMessage};
-use crate::session::{Encrypted, EncryptedState, GlobalRequestResponse, Kex, KexInit};
+use crate::session::{CryptoWriter, Encrypted, EncryptedState, GlobalRequestResponse, Kex, KexInit};
+use crate::ssh_read::SshRead;
+use crate::sshbuffer::SSHBuffer;
 use crate::{
     auth, msg, negotiation, strict_kex_violation, Channel, ChannelId, ChannelMsg,
     ChannelOpenFailure, ChannelParams, Sig,
@@ -202,10 +206,10 @@ impl Session {
                                         rejection_count: 0,
                                     },
                                 };
-                                let len = enc.write.len();
+                                let len = enc.main_writer.write.len();
                                 #[allow(clippy::indexing_slicing)] // length checked
                                 if enc.write_auth_request(&self.common.auth_user, meth) {
-                                    debug!("enc: {:?}", &enc.write[len..]);
+                                    debug!("enc: {:?}", &enc.main_writer.write[len..]);
                                     enc.state = EncryptedState::WaitingAuthRequest(auth_request)
                                 }
                             } else {
@@ -364,9 +368,9 @@ impl Session {
                                 };
                                 if self.common.buffer.len() != len {
                                     // The buffer was modified.
-                                    push_packet!(enc.write, {
+                                    push_packet!(enc.main_writer.write, {
                                         #[allow(clippy::indexing_slicing)] // length checked
-                                        enc.write.extend(&self.common.buffer[i..]);
+                                        enc.main_writer.write.extend(&self.common.buffer[i..]);
                                     })
                                 }
                             }
@@ -400,9 +404,11 @@ impl Session {
         client: &mut H,
         buf: &[u8],
     ) -> Result<(), H::Error> {
+        info!("FIRST {}", buf.first().unwrap());
         match buf.first() {
+            
             Some(&msg::CHANNEL_OPEN_CONFIRMATION) => {
-                debug!("channel_open_confirmation");
+                info!("channel_open_confirmation");
                 let mut reader = buf.reader(1);
                 let msg = ChannelOpenConfirmation::parse(&mut reader)?;
                 let local_id = ChannelId(msg.recipient_channel);
@@ -430,6 +436,23 @@ impl Session {
                     error!("no channel for id {local_id:?}");
                 }
 
+                if let Ok(Some(mut stream)) = client.channel_accept_stream(local_id.clone()).await {
+                    //Reads the ack string
+                    let mut buf: Vec<u8> = vec![0;3];
+                    _ = stream.read_exact(&mut buf).await;
+                    info!("ACCEPTED NEW STREAM!");
+
+                    let (read,write) = SshRead::new(stream).split();
+
+                    let mut opening_cipher = Box::new(clear::Key) as Box<dyn OpeningKey + Send>;
+                    std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
+
+                    let r = start_reading(read, self.common.read_buffer.clone(), opening_cipher);
+                    let r = Box::pin(r);
+                    self.channel_reads.push(r);
+                    self.channel_streams.insert(local_id.clone(), write);
+                }
+
                 client
                     .channel_open_confirmation(
                         local_id,
@@ -438,6 +461,7 @@ impl Session {
                         self,
                     )
                     .await
+
             }
             Some(&msg::CHANNEL_CLOSE) => {
                 debug!("channel_close");
@@ -602,9 +626,9 @@ impl Session {
                                     std::str::from_utf8(req),
                                 );
                                 self.common.wants_reply = false;
-                                push_packet!(enc.write, {
-                                    enc.write.push(msg::CHANNEL_SUCCESS);
-                                    enc.write.push_u32_be(channel_num.0)
+                                push_packet!(enc.main_writer.write, {
+                                    enc.main_writer.write.push(msg::CHANNEL_SUCCESS);
+                                    enc.main_writer.write.push_u32_be(channel_num.0)
                                 });
                             }
                         } else {
@@ -617,9 +641,9 @@ impl Session {
                         if wants_reply == 1 {
                             if let Some(ref mut enc) = self.common.encrypted {
                                 self.common.wants_reply = false;
-                                push_packet!(enc.write, {
-                                    enc.write.push(msg::CHANNEL_FAILURE);
-                                    enc.write.push_u32_be(channel_num.0)
+                                push_packet!(enc.main_writer.write, {
+                                    enc.main_writer.write.push(msg::CHANNEL_FAILURE);
+                                    enc.main_writer.write.push_u32_be(channel_num.0)
                                 })
                             }
                         }
@@ -670,7 +694,7 @@ impl Session {
                                 std::str::from_utf8(req),
                             );
                             self.common.wants_reply = false;
-                            push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS));
+                            push_packet!(enc.main_writer.write, enc.main_writer.write.push(msg::REQUEST_SUCCESS));
                         } else {
                             warn!("Received keepalive without reply request!");
                         }
@@ -706,7 +730,7 @@ impl Session {
                             wants_reply
                         );
                         self.common.wants_reply = false;
-                        push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                        push_packet!(enc.main_writer.write, enc.main_writer.write.push(msg::REQUEST_FAILURE))
                     }
                 }
                 self.common.received_data = false;
@@ -746,12 +770,18 @@ impl Session {
                         pending_data: std::collections::VecDeque::new(),
                         pending_eof: false,
                         pending_close: false,
+                        writer: CryptoWriter {
+                            write: CryptoVec::new(),
+                            write_cursor: 0,
+                            compress_buffer: CryptoVec::new()
+                        },
+                        write_buffer: SSHBuffer::new()
                     };
 
                     let confirm = || {
                         debug!("confirming channel: {:?}", msg);
                         msg.confirm(
-                            &mut enc.write,
+                            &mut enc.main_writer.write,
                             id.0,
                             channel.sender_window_size,
                             channel.sender_maximum_packet_size,
@@ -815,7 +845,7 @@ impl Session {
                                 confirm();
                             } else {
                                 debug!("unknown channel type: {}", String::from_utf8_lossy(typ));
-                                msg.unknown_type(&mut enc.write);
+                                msg.unknown_type(&mut enc.main_writer.write);
                             }
                         }
                     };
@@ -937,63 +967,65 @@ impl Session {
 impl Encrypted {
     fn write_auth_request(&mut self, user: &str, auth_method: &auth::Method) -> bool {
         // The server is waiting for our USERAUTH_REQUEST.
-        push_packet!(self.write, {
-            self.write.push(msg::USERAUTH_REQUEST);
+
+        let mut main_writer = &mut self.main_writer.write;
+        push_packet!(main_writer, {
+            main_writer.push(msg::USERAUTH_REQUEST);
 
             match *auth_method {
                 auth::Method::None => {
-                    self.write.extend_ssh_string(user.as_bytes());
-                    self.write.extend_ssh_string(b"ssh-connection");
-                    self.write.extend_ssh_string(b"none");
+                    main_writer.extend_ssh_string(user.as_bytes());
+                    main_writer.extend_ssh_string(b"ssh-connection");
+                    main_writer.extend_ssh_string(b"none");
                     true
                 }
                 auth::Method::Password { ref password } => {
-                    self.write.extend_ssh_string(user.as_bytes());
-                    self.write.extend_ssh_string(b"ssh-connection");
-                    self.write.extend_ssh_string(b"password");
-                    self.write.push(0);
-                    self.write.extend_ssh_string(password.as_bytes());
+                    main_writer.extend_ssh_string(user.as_bytes());
+                    main_writer.extend_ssh_string(b"ssh-connection");
+                    main_writer.extend_ssh_string(b"password");
+                    main_writer.push(0);
+                    main_writer.extend_ssh_string(password.as_bytes());
                     true
                 }
                 auth::Method::PublicKey { ref key } => {
-                    self.write.extend_ssh_string(user.as_bytes());
-                    self.write.extend_ssh_string(b"ssh-connection");
-                    self.write.extend_ssh_string(b"publickey");
-                    self.write.push(0); // This is a probe
+                    main_writer.extend_ssh_string(user.as_bytes());
+                    main_writer.extend_ssh_string(b"ssh-connection");
+                    main_writer.extend_ssh_string(b"publickey");
+                    main_writer.push(0); // This is a probe
 
                     debug!("write_auth_request: key - {:?}", key.name());
-                    self.write.extend_ssh_string(key.name().as_bytes());
-                    key.push_to(&mut self.write);
+                    main_writer.extend_ssh_string(key.name().as_bytes());
+                    key.push_to(&mut main_writer);
                     true
                 }
                 auth::Method::OpenSSHCertificate { ref cert, .. } => {
-                    self.write.extend_ssh_string(user.as_bytes());
-                    self.write.extend_ssh_string(b"ssh-connection");
-                    self.write.extend_ssh_string(b"publickey");
-                    self.write.push(0); // This is a probe
+                    main_writer.extend_ssh_string(user.as_bytes());
+                    main_writer.extend_ssh_string(b"ssh-connection");
+                    main_writer.extend_ssh_string(b"publickey");
+                    main_writer.push(0); // This is a probe
 
                     debug!("write_auth_request: cert - {:?}", cert.name());
-                    self.write.extend_ssh_string(cert.name().as_bytes());
-                    cert.push_to(&mut self.write);
+                    main_writer.extend_ssh_string(cert.name().as_bytes());
+                    cert.push_to(&mut main_writer);
                     true
                 }
                 auth::Method::FuturePublicKey { ref key, .. } => {
-                    self.write.extend_ssh_string(user.as_bytes());
-                    self.write.extend_ssh_string(b"ssh-connection");
-                    self.write.extend_ssh_string(b"publickey");
-                    self.write.push(0); // This is a probe
+                    main_writer.extend_ssh_string(user.as_bytes());
+                    main_writer.extend_ssh_string(b"ssh-connection");
+                    main_writer.extend_ssh_string(b"publickey");
+                    main_writer.push(0); // This is a probe
 
-                    self.write.extend_ssh_string(key.name().as_bytes());
-                    key.push_to(&mut self.write);
+                    main_writer.extend_ssh_string(key.name().as_bytes());
+                    key.push_to(&mut main_writer);
                     true
                 }
                 auth::Method::KeyboardInteractive { ref submethods } => {
                     debug!("Keyboard Iinteractive");
-                    self.write.extend_ssh_string(user.as_bytes());
-                    self.write.extend_ssh_string(b"ssh-connection");
-                    self.write.extend_ssh_string(b"keyboard-interactive");
-                    self.write.extend_ssh_string(b""); // lang tag is deprecated. Should be empty
-                    self.write.extend_ssh_string(submethods.as_bytes());
+                    main_writer.extend_ssh_string(user.as_bytes());
+                    main_writer.extend_ssh_string(b"ssh-connection");
+                    main_writer.extend_ssh_string(b"keyboard-interactive");
+                    main_writer.extend_ssh_string(b""); // lang tag is deprecated. Should be empty
+                    main_writer.extend_ssh_string(submethods.as_bytes());
                     true
                 }
             }
@@ -1031,18 +1063,18 @@ impl Encrypted {
                 let i0 = self.client_make_to_sign(user, key.as_ref(), buffer);
                 // Extend with self-signature.
                 key.add_self_signature(buffer)?;
-                push_packet!(self.write, {
+                push_packet!(self.main_writer.write, {
                     #[allow(clippy::indexing_slicing)] // length checked
-                    self.write.extend(&buffer[i0..]);
+                    self.main_writer.write.extend(&buffer[i0..]);
                 })
             }
             auth::Method::OpenSSHCertificate { ref key, ref cert } => {
                 let i0 = self.client_make_to_sign(user, cert, buffer);
                 // Extend with self-signature.
                 key.add_self_signature(buffer)?;
-                push_packet!(self.write, {
+                push_packet!(self.main_writer.write, {
                     #[allow(clippy::indexing_slicing)] // length checked
-                    self.write.extend(&buffer[i0..]);
+                    self.main_writer.write.extend(&buffer[i0..]);
                 })
             }
             _ => {}
@@ -1051,13 +1083,13 @@ impl Encrypted {
     }
 
     fn client_send_auth_response(&mut self, responses: &[String]) -> Result<(), crate::Error> {
-        push_packet!(self.write, {
-            self.write.push(msg::USERAUTH_INFO_RESPONSE);
-            self.write
+        push_packet!(self.main_writer.write, {
+            self.main_writer.write.push(msg::USERAUTH_INFO_RESPONSE);
+            self.main_writer.write
                 .push_u32_be(responses.len().try_into().unwrap_or(0)); // number of responses
 
             for r in responses {
-                self.write.extend_ssh_string(r.as_bytes()); // write the reponses
+                self.main_writer.write.extend_ssh_string(r.as_bytes()); // write the reponses
             }
         });
         Ok(())

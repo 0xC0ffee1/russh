@@ -23,22 +23,22 @@ impl Session {
                         self.common.config.window_size,
                         self.common.config.maximum_packet_size,
                     );
-                    push_packet!(enc.write, {
-                        enc.write.push(msg::CHANNEL_OPEN);
-                        enc.write.extend_ssh_string(kind);
+                    push_packet!(enc.main_writer.write, {
+                        enc.main_writer.write.push(msg::CHANNEL_OPEN);
+                        enc.main_writer.write.extend_ssh_string(kind);
 
                         // sender channel id.
-                        enc.write.push_u32_be(sender_channel.0);
+                        enc.main_writer.write.push_u32_be(sender_channel.0);
 
                         // window.
-                        enc.write
+                        enc.main_writer.write
                             .push_u32_be(self.common.config.as_ref().window_size);
 
                         // max packet size.
-                        enc.write
+                        enc.main_writer.write
                             .push_u32_be(self.common.config.as_ref().maximum_packet_size);
 
-                        write_suffix(&mut enc.write);
+                        write_suffix(&mut enc.main_writer.write);
                     });
                     sender_channel
                 }
@@ -104,27 +104,27 @@ impl Session {
         terminal_modes: &[(Pty, u32)],
     ) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
+            if let Some(channel) = enc.channels.get_mut(&channel) {
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
 
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"pty-req");
-                    enc.write.push(want_reply as u8);
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"pty-req");
+                    channel.writer.write.push(want_reply as u8);
 
-                    enc.write.extend_ssh_string(term.as_bytes());
-                    enc.write.push_u32_be(col_width);
-                    enc.write.push_u32_be(row_height);
-                    enc.write.push_u32_be(pix_width);
-                    enc.write.push_u32_be(pix_height);
+                    channel.writer.write.extend_ssh_string(term.as_bytes());
+                    channel.writer.write.push_u32_be(col_width);
+                    channel.writer.write.push_u32_be(row_height);
+                    channel.writer.write.push_u32_be(pix_width);
+                    channel.writer.write.push_u32_be(pix_height);
 
-                    enc.write.push_u32_be((1 + 5 * terminal_modes.len()) as u32);
+                    channel.writer.write.push_u32_be((1 + 5 * terminal_modes.len()) as u32);
                     for &(code, value) in terminal_modes {
-                        enc.write.push(code as u8);
-                        enc.write.push_u32_be(value)
+                        channel.writer.write.push(code as u8);
+                        channel.writer.write.push_u32_be(value)
                     }
                     // 0 code (to terminate the list)
-                    enc.write.push(0);
+                    channel.writer.write.push(0);
                 });
             }
         }
@@ -140,19 +140,19 @@ impl Session {
         x11_screen_number: u32,
     ) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
+            if let Some(channel) = enc.channels.get_mut(&channel) {
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
 
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"x11-req");
-                    enc.write.push(want_reply as u8);
-                    enc.write.push(single_connection as u8);
-                    enc.write
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"x11-req");
+                    channel.writer.write.push(want_reply as u8);
+                    channel.writer.write.push(single_connection as u8);
+                    channel.writer.write
                         .extend_ssh_string(x11_authentication_protocol.as_bytes());
-                    enc.write
+                    channel.writer.write
                         .extend_ssh_string(x11_authentication_cookie.as_bytes());
-                    enc.write.push_u32_be(x11_screen_number);
+                    channel.writer.write.push_u32_be(x11_screen_number);
                 });
             }
         }
@@ -166,15 +166,15 @@ impl Session {
         variable_value: &str,
     ) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
+            if let Some(channel) = enc.channels.get_mut(&channel) {
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
 
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"env");
-                    enc.write.push(want_reply as u8);
-                    enc.write.extend_ssh_string(variable_name.as_bytes());
-                    enc.write.extend_ssh_string(variable_value.as_bytes());
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"env");
+                    channel.writer.write.push(want_reply as u8);
+                    channel.writer.write.extend_ssh_string(variable_name.as_bytes());
+                    channel.writer.write.extend_ssh_string(variable_value.as_bytes());
                 });
             }
         }
@@ -182,13 +182,13 @@ impl Session {
 
     pub fn request_shell(&mut self, want_reply: bool, channel: ChannelId) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
+            if let Some(channel) = enc.channels.get_mut(&channel) {
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
 
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"shell");
-                    enc.write.push(want_reply as u8);
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"shell");
+                    channel.writer.write.push(want_reply as u8);
                 });
             }
         }
@@ -196,14 +196,14 @@ impl Session {
 
     pub fn exec(&mut self, channel: ChannelId, want_reply: bool, command: &[u8]) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
+            if let Some(channel) = enc.channels.get_mut(&channel) {
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
 
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"exec");
-                    enc.write.push(want_reply as u8);
-                    enc.write.extend_ssh_string(command);
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"exec");
+                    channel.writer.write.push(want_reply as u8);
+                    channel.writer.write.extend_ssh_string(command);
                 });
                 return;
             }
@@ -213,13 +213,13 @@ impl Session {
 
     pub fn signal(&mut self, channel: ChannelId, signal: Sig) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"signal");
-                    enc.write.push(0);
-                    enc.write.extend_ssh_string(signal.name().as_bytes());
+            if let Some(channel) = enc.channels.get_mut(&channel) {
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"signal");
+                    channel.writer.write.push(0);
+                    channel.writer.write.extend_ssh_string(signal.name().as_bytes());
                 });
             }
         }
@@ -227,14 +227,14 @@ impl Session {
 
     pub fn request_subsystem(&mut self, want_reply: bool, channel: ChannelId, name: &str) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
+            if let Some(channel) = enc.channels.get_mut(&channel) {
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
 
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"subsystem");
-                    enc.write.push(want_reply as u8);
-                    enc.write.extend_ssh_string(name.as_bytes());
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"subsystem");
+                    channel.writer.write.push(want_reply as u8);
+                    channel.writer.write.extend_ssh_string(name.as_bytes());
                 });
             }
         }
@@ -249,17 +249,17 @@ impl Session {
         pix_height: u32,
     ) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
+            if let Some(channel) = enc.channels.get_mut(&channel) {
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
 
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"window-change");
-                    enc.write.push(0); // this packet never wants reply
-                    enc.write.push_u32_be(col_width);
-                    enc.write.push_u32_be(row_height);
-                    enc.write.push_u32_be(pix_width);
-                    enc.write.push_u32_be(pix_height);
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"window-change");
+                    channel.writer.write.push(0); // this packet never wants reply
+                    channel.writer.write.push_u32_be(col_width);
+                    channel.writer.write.push_u32_be(row_height);
+                    channel.writer.write.push_u32_be(pix_width);
+                    channel.writer.write.push_u32_be(pix_height);
                 });
             }
         }
@@ -282,12 +282,12 @@ impl Session {
                     crate::session::GlobalRequestResponse::TcpIpForward(reply_channel),
                 );
             }
-            push_packet!(enc.write, {
-                enc.write.push(msg::GLOBAL_REQUEST);
-                enc.write.extend_ssh_string(b"tcpip-forward");
-                enc.write.push(want_reply as u8);
-                enc.write.extend_ssh_string(address.as_bytes());
-                enc.write.push_u32_be(port);
+            push_packet!(enc.main_writer.write, {
+                enc.main_writer.write.push(msg::GLOBAL_REQUEST);
+                enc.main_writer.write.extend_ssh_string(b"tcpip-forward");
+                enc.main_writer.write.push(want_reply as u8);
+                enc.main_writer.write.extend_ssh_string(address.as_bytes());
+                enc.main_writer.write.push_u32_be(port);
             });
         }
     }
@@ -309,12 +309,12 @@ impl Session {
                     crate::session::GlobalRequestResponse::CancelTcpIpForward(reply_channel),
                 );
             }
-            push_packet!(enc.write, {
-                enc.write.push(msg::GLOBAL_REQUEST);
-                enc.write.extend_ssh_string(b"cancel-tcpip-forward");
-                enc.write.push(want_reply as u8);
-                enc.write.extend_ssh_string(address.as_bytes());
-                enc.write.push_u32_be(port);
+            push_packet!(enc.main_writer.write, {
+                enc.main_writer.write.push(msg::GLOBAL_REQUEST);
+                enc.main_writer.write.extend_ssh_string(b"cancel-tcpip-forward");
+                enc.main_writer.write.push(want_reply as u8);
+                enc.main_writer.write.extend_ssh_string(address.as_bytes());
+                enc.main_writer.write.push_u32_be(port);
             });
         }
     }
@@ -323,10 +323,10 @@ impl Session {
         self.open_global_requests
             .push_back(crate::session::GlobalRequestResponse::Keepalive);
         if let Some(ref mut enc) = self.common.encrypted {
-            push_packet!(enc.write, {
-                enc.write.push(msg::GLOBAL_REQUEST);
-                enc.write.extend_ssh_string(b"keepalive@openssh.com");
-                enc.write.push(want_reply as u8);
+            push_packet!(enc.main_writer.write, {
+                enc.main_writer.write.push(msg::GLOBAL_REQUEST);
+                enc.main_writer.write.extend_ssh_string(b"keepalive@openssh.com");
+                enc.main_writer.write.push(want_reply as u8);
             });
         }
     }
@@ -365,12 +365,12 @@ impl Session {
 
     pub fn agent_forward(&mut self, channel: ChannelId, want_reply: bool) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"auth-agent-req@openssh.com");
-                    enc.write.push(want_reply as u8);
+            if let Some(channel) = enc.channels.get_mut(&channel) {
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"auth-agent-req@openssh.com");
+                    channel.writer.write.push(want_reply as u8);
                 });
             }
         }

@@ -1,9 +1,11 @@
 use std::collections::{HashMap, VecDeque};
+use std::ops::Sub;
 use std::sync::Arc;
-
+use futures::future::{self, select_all, FutureExt, OptionFuture};
+use futures::stream::FuturesUnordered;
 use log::debug;
 use russh_keys::encoding::{Encoding, Reader};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc::{unbounded_channel, Receiver, Sender, UnboundedReceiver};
 use tokio::sync::{oneshot, Mutex};
 
@@ -11,6 +13,10 @@ use super::*;
 use crate::channels::{Channel, ChannelMsg, ChannelRef};
 use crate::kex::EXTENSION_SUPPORT_AS_CLIENT;
 use crate::msg;
+use futures::StreamExt;
+
+pub(crate) type ChannelReadFuture<R> = Pin<Box<dyn Future<Output = Result<(usize, SshRead<ReadHalf<R>>, Arc<Mutex<SSHBuffer>>, Box<dyn OpeningKey + Send>), Error>> + Send>>;
+
 
 /// A connected server session. This type is unique to a client.
 pub struct Session {
@@ -22,7 +28,10 @@ pub struct Session {
     pub(crate) pending_len: u32,
     pub(crate) channels: HashMap<ChannelId, ChannelRef>,
     pub(crate) open_global_requests: VecDeque<GlobalRequestResponse>,
+    pub(crate) channel_streams: HashMap<ChannelId, WriteHalf<Box<dyn SubStream>>>,
+    pub(crate) channel_reads: FuturesUnordered<ChannelReadFuture<Box<dyn SubStream>>>,
 }
+
 #[derive(Debug)]
 pub enum Msg {
     ChannelOpenSession {
@@ -398,7 +407,6 @@ impl Session {
         self.common.write_buffer.buffer.clear();
 
         let (stream_read, mut stream_write) = stream.split();
-        let buffer = SSHBuffer::new();
 
         // Allow handing out references to the cipher
         let mut opening_cipher = Box::new(clear::Key) as Box<dyn OpeningKey + Send>;
@@ -412,23 +420,28 @@ impl Session {
             future_or_pending(self.common.config.inactivity_timeout, tokio::time::sleep);
         pin!(inactivity_timer);
 
-        let reading = start_reading(stream_read, buffer, opening_cipher);
+        let reading = start_reading(stream_read, self.common.read_buffer.clone(), opening_cipher);
         pin!(reading);
         let mut is_reading = None;
+        let mut is_channel_reading = None;
         let mut decomp = CryptoVec::new();
 
         #[allow(clippy::panic)] // false positive in macro
+
+        //use futures::future::select_all for a vec of read part of bistreams mapped for channels
         while !self.common.disconnected {
             self.common.received_data = false;
             let mut sent_keepalive = false;
+
             tokio::select! {
                 r = &mut reading => {
-                    let (stream_read, mut buffer, mut opening_cipher) = match r {
-                        Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
+                    let (stream_read, mut buffer_guard, mut opening_cipher) = match r {
+                        Ok((_, stream_read, buffer_guard, opening_cipher)) => (stream_read, buffer_guard, opening_cipher),
                         Err(e) => return Err(e.into())
                     };
+                    let mut buffer = buffer_guard.lock().await;
                     if buffer.buffer.len() < 5 {
-                        is_reading = Some((stream_read, buffer, opening_cipher));
+                        is_reading = Some((stream_read, buffer_guard.clone(), opening_cipher));
                         break
                     }
                     #[allow(clippy::indexing_slicing)] // length checked
@@ -441,7 +454,7 @@ impl Session {
                             buf
                         } else {
                             debug!("err = {:?}", d);
-                            is_reading = Some((stream_read, buffer, opening_cipher));
+                            is_reading = Some((stream_read, buffer_guard.clone(), opening_cipher));
                             break
                         }
                     } else {
@@ -451,20 +464,76 @@ impl Session {
                         #[allow(clippy::indexing_slicing)] // length checked
                         if buf[0] == crate::msg::DISCONNECT {
                             debug!("break");
-                            is_reading = Some((stream_read, buffer, opening_cipher));
+                            is_reading = Some((stream_read, buffer_guard.clone(), opening_cipher));
                             break;
                         } else {
                             self.common.received_data = true;
                             std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
+
+                            //Figure out a better way to do this, probably just do what the comment below says
+                            let mut vec = vec![0; buf.len()];
+                            vec.copy_from_slice(buf);
+
                             // TODO it'd be cleaner to just pass cipher to reply()
-                            match reply(&mut self, &mut handler, &mut buffer.seqn, buf).await {
+                            match reply(&mut self, &mut handler, &mut buffer.seqn, &vec).await {
                                 Ok(_) => {},
                                 Err(e) => return Err(e),
                             }
                             std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
                         }
                     }
-                    reading.set(start_reading(stream_read, buffer, opening_cipher));
+                    reading.set(start_reading(stream_read, buffer_guard.clone(), opening_cipher));
+                }
+                Some(opt_r) = self.channel_reads.next() => { 
+                    let (stream_read, mut buffer_guard, mut opening_cipher) = match opt_r {
+                        Ok((_, stream_read, buffer_guard, opening_cipher)) => (stream_read, buffer_guard, opening_cipher),
+                        Err(e) => return Err(e.into())
+                    };
+                    let mut buffer = buffer_guard.lock().await;
+                    if buffer.buffer.len() < 5 {
+                        is_channel_reading = Some((stream_read, buffer_guard.clone(), opening_cipher));
+                        break
+                    }
+                    #[allow(clippy::indexing_slicing)] // length checked
+                    let buf = if let Some(ref mut enc) = self.common.encrypted {
+                        let d = enc.decompress.decompress(
+                            &buffer.buffer[5..],
+                            &mut decomp,
+                        );
+                        if let Ok(buf) = d {
+                            buf
+                        } else {
+                            debug!("err = {:?}", d);
+                            is_channel_reading = Some((stream_read, buffer_guard.clone(), opening_cipher));
+                            break
+                        }
+                    } else {
+                        &buffer.buffer[5..]
+                    };
+                    if !buf.is_empty() {
+                        #[allow(clippy::indexing_slicing)] // length checked
+                        if buf[0] == crate::msg::DISCONNECT {
+                            debug!("break");
+                            is_channel_reading = Some((stream_read, buffer_guard.clone(), opening_cipher));
+                            break;
+                        } else {
+                            self.common.received_data = true;
+                            std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
+
+                            //Figure out a better way to do this, probably just do what the comment below says
+                            let mut vec = vec![0; buf.len()];
+                            vec.copy_from_slice(buf);
+
+                            // TODO it'd be cleaner to just pass cipher to reply()
+                            match reply(&mut self, &mut handler, &mut buffer.seqn, &vec).await {
+                                Ok(_) => {},
+                                Err(e) => return Err(e),
+                            }
+                            std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
+                        }
+                    }
+                    let new_future = start_reading(stream_read, buffer_guard.clone(), opening_cipher);
+                    self.channel_reads.push(Box::pin(new_future));
                 }
                 () = &mut keepalive_timer => {
                     if self.common.config.keepalive_max != 0 && self.common.alive_timeouts > self.common.config.keepalive_max {
@@ -479,6 +548,7 @@ impl Session {
                     debug!("timeout");
                     return Err(crate::Error::InactivityTimeout.into());
                 }
+                //Receiver from the handle
                 msg = self.receiver.recv(), if !self.is_rekeying() => {
                     match msg {
                         Some(Msg::Channel(id, ChannelMsg::Data { data })) => {
@@ -547,12 +617,38 @@ impl Session {
                     }
                 }
             }
+            
             self.flush()?;
             stream_write
                 .write_all(&self.common.write_buffer.buffer)
                 .await
                 .map_err(crate::Error::from)?;
             self.common.write_buffer.buffer.clear();
+
+            if let Some(ref mut enc) = self.common.encrypted {
+                let channels: Vec<_> = enc.channels.keys().cloned().collect();
+
+                for id in channels {
+                    let _ = enc.flush_channel_test(&id, &self.common.config.as_ref().limits, &mut *self.common.cipher.local_to_remote, &mut self.common.write_buffer);
+                    if self.common.write_buffer.buffer.is_empty() {continue;}
+                    log::info!(
+                        "writing to CHANNEL stream: {:?} bytes",
+                        self.common.write_buffer.buffer.len()
+                    );
+
+                    let sub_write = self.channel_streams.get_mut(&id).unwrap();
+                    log::info!("Now writing to channel stream!");
+                    sub_write
+                        .write_all(&self.common.write_buffer.buffer)
+                        .await
+                        .map_err(crate::Error::from)?;
+
+                    sub_write.flush().await.map_err(crate::Error::from)?;
+
+                    self.common.write_buffer.buffer.clear();
+                }
+            }
+            stream_write.flush().await.map_err(crate::Error::from)?;
 
             if self.common.received_data {
                 // Reset the number of failed keepalive attempts. We don't
@@ -562,6 +658,7 @@ impl Session {
                 // data from it.
                 self.common.alive_timeouts = 0;
             }
+
             if self.common.received_data || sent_keepalive {
                 if let (futures::future::Either::Right(ref mut sleep), Some(d)) = (
                     keepalive_timer.as_mut().as_pin_mut(),
@@ -636,7 +733,7 @@ impl Session {
             if enc.flush(
                 &self.common.config.as_ref().limits,
                 &mut *self.common.cipher.local_to_remote,
-                &mut self.common.write_buffer,
+                &mut self.common.write_buffer
             )? && enc.rekey.is_none()
             {
                 debug!("starting rekeying");
@@ -696,7 +793,7 @@ impl Session {
         if self.common.wants_reply {
             if let Some(ref mut enc) = self.common.encrypted {
                 self.common.wants_reply = false;
-                push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS))
+                push_packet!(enc.main_writer.write, enc.main_writer.write.push(msg::REQUEST_SUCCESS))
             }
         }
     }
@@ -705,7 +802,7 @@ impl Session {
     pub fn request_failure(&mut self) {
         if let Some(ref mut enc) = self.common.encrypted {
             self.common.wants_reply = false;
-            push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+            push_packet!(enc.main_writer.write, enc.main_writer.write.push(msg::REQUEST_FAILURE))
         }
     }
 
@@ -719,9 +816,9 @@ impl Session {
                 if channel.wants_reply {
                     channel.wants_reply = false;
                     debug!("channel_success {:?}", channel);
-                    push_packet!(enc.write, {
-                        enc.write.push(msg::CHANNEL_SUCCESS);
-                        enc.write.push_u32_be(channel.recipient_channel);
+                    push_packet!(channel.writer.write, {
+                        channel.writer.write.push(msg::CHANNEL_SUCCESS);
+                        channel.writer.write.push_u32_be(channel.recipient_channel);
                     })
                 }
             }
@@ -735,9 +832,9 @@ impl Session {
                 assert!(channel.confirmed);
                 if channel.wants_reply {
                     channel.wants_reply = false;
-                    push_packet!(enc.write, {
-                        enc.write.push(msg::CHANNEL_FAILURE);
-                        enc.write.push_u32_be(channel.recipient_channel);
+                    push_packet!(channel.writer.write, {
+                        channel.writer.write.push(msg::CHANNEL_FAILURE);
+                        channel.writer.write.push_u32_be(channel.recipient_channel);
                     })
                 }
             }
@@ -753,12 +850,12 @@ impl Session {
         language: &str,
     ) {
         if let Some(ref mut enc) = self.common.encrypted {
-            push_packet!(enc.write, {
-                enc.write.push(msg::CHANNEL_OPEN_FAILURE);
-                enc.write.push_u32_be(channel.0);
-                enc.write.push_u32_be(reason as u32);
-                enc.write.extend_ssh_string(description.as_bytes());
-                enc.write.extend_ssh_string(language.as_bytes());
+            push_packet!(enc.main_writer.write, {
+                enc.main_writer.write.push(msg::CHANNEL_OPEN_FAILURE);
+                enc.main_writer.write.push_u32_be(channel.0);
+                enc.main_writer.write.push_u32_be(reason as u32);
+                enc.main_writer.write.extend_ssh_string(description.as_bytes());
+                enc.main_writer.write.extend_ssh_string(language.as_bytes());
             })
         }
     }
@@ -806,15 +903,15 @@ impl Session {
     /// [RFC4254](https://tools.ietf.org/html/rfc4254#section-6.8).
     pub fn xon_xoff_request(&mut self, channel: ChannelId, client_can_do: bool) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
+            if let Some(channel) = enc.channels.get_mut(&channel) {
                 assert!(channel.confirmed);
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
 
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"xon-xoff");
-                    enc.write.push(0);
-                    enc.write.push(client_can_do as u8);
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"xon-xoff");
+                    channel.writer.write.push(0);
+                    channel.writer.write.push(client_can_do as u8);
                 })
             }
         }
@@ -826,10 +923,10 @@ impl Session {
         if let Some(ref mut enc) = self.common.encrypted {
             self.open_global_requests
                 .push_back(GlobalRequestResponse::Keepalive);
-            push_packet!(enc.write, {
-                enc.write.push(msg::GLOBAL_REQUEST);
-                enc.write.extend_ssh_string(b"keepalive@openssh.com");
-                enc.write.push(want_reply);
+            push_packet!(enc.main_writer.write, {
+                enc.main_writer.write.push(msg::GLOBAL_REQUEST);
+                enc.main_writer.write.extend_ssh_string(b"keepalive@openssh.com");
+                enc.main_writer.write.push(want_reply);
             })
         }
     }
@@ -837,15 +934,15 @@ impl Session {
     /// Send the exit status of a program.
     pub fn exit_status_request(&mut self, channel: ChannelId, exit_status: u32) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
+            if let Some(channel) = enc.channels.get_mut(&channel) {
                 assert!(channel.confirmed);
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
 
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"exit-status");
-                    enc.write.push(0);
-                    enc.write.push_u32_be(exit_status)
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"exit-status");
+                    channel.writer.write.push(0);
+                    channel.writer.write.push_u32_be(exit_status)
                 })
             }
         }
@@ -861,18 +958,18 @@ impl Session {
         language_tag: &str,
     ) {
         if let Some(ref mut enc) = self.common.encrypted {
-            if let Some(channel) = enc.channels.get(&channel) {
+            if let Some(channel) = enc.channels.get_mut(&channel) {
                 assert!(channel.confirmed);
-                push_packet!(enc.write, {
-                    enc.write.push(msg::CHANNEL_REQUEST);
+                push_packet!(channel.writer.write, {
+                    channel.writer.write.push(msg::CHANNEL_REQUEST);
 
-                    enc.write.push_u32_be(channel.recipient_channel);
-                    enc.write.extend_ssh_string(b"exit-signal");
-                    enc.write.push(0);
-                    enc.write.extend_ssh_string(signal.name().as_bytes());
-                    enc.write.push(core_dumped as u8);
-                    enc.write.extend_ssh_string(error_message.as_bytes());
-                    enc.write.extend_ssh_string(language_tag.as_bytes());
+                    channel.writer.write.push_u32_be(channel.recipient_channel);
+                    channel.writer.write.extend_ssh_string(b"exit-signal");
+                    channel.writer.write.push(0);
+                    channel.writer.write.extend_ssh_string(signal.name().as_bytes());
+                    channel.writer.write.push(core_dumped as u8);
+                    channel.writer.write.extend_ssh_string(error_message.as_bytes());
+                    channel.writer.write.extend_ssh_string(language_tag.as_bytes());
                 })
             }
         }
@@ -954,22 +1051,22 @@ impl Session {
                 self.common.config.window_size,
                 self.common.config.maximum_packet_size,
             );
-            push_packet!(enc.write, {
-                enc.write.push(msg::CHANNEL_OPEN);
-                enc.write.extend_ssh_string(kind);
+            push_packet!(enc.main_writer.write, {
+                enc.main_writer.write.push(msg::CHANNEL_OPEN);
+                enc.main_writer.write.extend_ssh_string(kind);
 
                 // sender channel id.
-                enc.write.push_u32_be(sender_channel.0);
+                enc.main_writer.write.push_u32_be(sender_channel.0);
 
                 // window.
-                enc.write
+                enc.main_writer.write
                     .push_u32_be(self.common.config.as_ref().window_size);
 
                 // max packet size.
-                enc.write
+                enc.main_writer.write
                     .push_u32_be(self.common.config.as_ref().maximum_packet_size);
 
-                write_suffix(&mut enc.write);
+                write_suffix(&mut enc.main_writer.write);
             });
             sender_channel
         } else {
@@ -994,12 +1091,12 @@ impl Session {
                     crate::session::GlobalRequestResponse::TcpIpForward(reply_channel),
                 );
             }
-            push_packet!(enc.write, {
-                enc.write.push(msg::GLOBAL_REQUEST);
-                enc.write.extend_ssh_string(b"tcpip-forward");
-                enc.write.push(want_reply as u8);
-                enc.write.extend_ssh_string(address.as_bytes());
-                enc.write.push_u32_be(port);
+            push_packet!(enc.main_writer.write, {
+                enc.main_writer.write.push(msg::GLOBAL_REQUEST);
+                enc.main_writer.write.extend_ssh_string(b"tcpip-forward");
+                enc.main_writer.write.push(want_reply as u8);
+                enc.main_writer.write.extend_ssh_string(address.as_bytes());
+                enc.main_writer.write.push_u32_be(port);
             });
         }
     }
@@ -1018,12 +1115,12 @@ impl Session {
                     crate::session::GlobalRequestResponse::CancelTcpIpForward(reply_channel),
                 );
             }
-            push_packet!(enc.write, {
-                enc.write.push(msg::GLOBAL_REQUEST);
-                enc.write.extend_ssh_string(b"cancel-tcpip-forward");
-                enc.write.push(want_reply as u8);
-                enc.write.extend_ssh_string(address.as_bytes());
-                enc.write.push_u32_be(port);
+            push_packet!(enc.main_writer.write, {
+                enc.main_writer.write.push(msg::GLOBAL_REQUEST);
+                enc.main_writer.write.extend_ssh_string(b"cancel-tcpip-forward");
+                enc.main_writer.write.push(want_reply as u8);
+                enc.main_writer.write.extend_ssh_string(address.as_bytes());
+                enc.main_writer.write.push_u32_be(port);
             });
         }
     }
@@ -1062,11 +1159,11 @@ impl Session {
                 return;
             }
 
-            push_packet!(enc.write, {
-                enc.write.push(msg::EXT_INFO);
-                enc.write.push_u32_be(1);
-                enc.write.extend_ssh_string(b"server-sig-algs");
-                enc.write
+            push_packet!(enc.main_writer.write, {
+                enc.main_writer.write.push(msg::EXT_INFO);
+                enc.main_writer.write.push_u32_be(1);
+                enc.main_writer.write.extend_ssh_string(b"server-sig-algs");
+                enc.main_writer.write
                     .extend_list(self.common.config.preferred.key.iter());
             });
         }

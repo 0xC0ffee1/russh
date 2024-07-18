@@ -175,7 +175,7 @@ impl Session {
                     let auth_request = server_accept_service(
                         self.common.config.as_ref().auth_banner,
                         self.common.config.as_ref().methods,
-                        &mut enc.write,
+                        &mut enc.main_writer.write,
                     );
                     *accepted = true;
                     enc.state = EncryptedState::WaitingAuthRequest(auth_request);
@@ -206,7 +206,7 @@ impl Session {
                 let resp = read_userauth_info_response(
                     rejection_wait_until,
                     handler,
-                    &mut enc.write,
+                    &mut enc.main_writer.write,
                     auth,
                     &self.common.auth_user,
                     buf,
@@ -295,7 +295,7 @@ impl Encrypted {
                 let password = std::str::from_utf8(password).map_err(crate::Error::from)?;
                 let auth = handler.auth_password(user, password).await?;
                 if let Auth::Accept = auth {
-                    server_auth_request_success(&mut self.write);
+                    server_auth_request_success(&mut self.main_writer.write);
                     self.state = EncryptedState::InitCompression;
                 } else {
                     auth_user.clear();
@@ -308,7 +308,7 @@ impl Encrypted {
                         auth_request.methods -= MethodSet::PASSWORD;
                     }
                     auth_request.partial_success = false;
-                    reject_auth_request(until, &mut self.write, auth_request).await;
+                    reject_auth_request(until, &mut self.main_writer.write, auth_request).await;
                 }
                 Ok(())
             } else if method == b"publickey" {
@@ -328,7 +328,7 @@ impl Encrypted {
 
                 let auth = handler.auth_none(user).await?;
                 if let Auth::Accept = auth {
-                    server_auth_request_success(&mut self.write);
+                    server_auth_request_success(&mut self.main_writer.write);
                     self.state = EncryptedState::InitCompression;
                 } else {
                     auth_user.clear();
@@ -341,7 +341,7 @@ impl Encrypted {
                         auth_request.methods -= MethodSet::NONE;
                     }
                     auth_request.partial_success = false;
-                    reject_auth_request(until, &mut self.write, auth_request).await;
+                    reject_auth_request(until, &mut self.main_writer.write, auth_request).await;
                 }
                 Ok(())
             } else if method == b"keyboard-interactive" {
@@ -363,7 +363,7 @@ impl Encrypted {
                 let auth = handler
                     .auth_keyboard_interactive(user, submethods, None)
                     .await?;
-                if reply_userauth_info_response(until, auth_request, &mut self.write, auth).await? {
+                if reply_userauth_info_response(until, auth_request, &mut self.main_writer.write, auth).await? {
                     self.state = EncryptedState::InitCompression
                 }
                 Ok(())
@@ -375,7 +375,7 @@ impl Encrypted {
                 } else {
                     unreachable!()
                 };
-                reject_auth_request(until, &mut self.write, auth_request).await;
+                reject_auth_request(until, &mut self.main_writer.write, auth_request).await;
                 Ok(())
             }
         } else {
@@ -459,7 +459,7 @@ impl Encrypted {
                             let auth = handler.auth_publickey(user, &pubkey).await?;
 
                             if auth == Auth::Accept {
-                                server_auth_request_success(&mut self.write);
+                                server_auth_request_success(&mut self.main_writer.write);
                                 self.state = EncryptedState::InitCompression;
                             } else {
                                 if let Auth::Reject {
@@ -470,14 +470,14 @@ impl Encrypted {
                                 }
                                 auth_request.partial_success = false;
                                 auth_user.clear();
-                                reject_auth_request(until, &mut self.write, auth_request).await;
+                                reject_auth_request(until, &mut self.main_writer.write, auth_request).await;
                             }
                         } else {
                             debug!("signature wrong");
-                            reject_auth_request(until, &mut self.write, auth_request).await;
+                            reject_auth_request(until, &mut self.main_writer.write, auth_request).await;
                         }
                     } else {
-                        reject_auth_request(until, &mut self.write, auth_request).await;
+                        reject_auth_request(until, &mut self.main_writer.write, auth_request).await;
                     }
                     Ok(())
                 } else {
@@ -492,10 +492,10 @@ impl Encrypted {
                             let mut algo = CryptoVec::new();
                             algo.extend(pubkey_algo);
                             debug!("pubkey_key: {:?}", pubkey_key);
-                            push_packet!(self.write, {
-                                self.write.push(msg::USERAUTH_PK_OK);
-                                self.write.extend_ssh_string(pubkey_algo);
-                                self.write.extend_ssh_string(pubkey_key);
+                            push_packet!(self.main_writer.write, {
+                                self.main_writer.write.push(msg::USERAUTH_PK_OK);
+                                self.main_writer.write.extend_ssh_string(pubkey_algo);
+                                self.main_writer.write.extend_ssh_string(pubkey_key);
                             });
 
                             auth_request.current = Some(CurrentRequest::PublicKey {
@@ -513,7 +513,7 @@ impl Encrypted {
                             }
                             auth_request.partial_success = false;
                             auth_user.clear();
-                            reject_auth_request(until, &mut self.write, auth_request).await;
+                            reject_auth_request(until, &mut self.main_writer.write, auth_request).await;
                         }
                     }
                     Ok(())
@@ -521,7 +521,7 @@ impl Encrypted {
             }
             Err(e) => {
                 if let russh_keys::Error::CouldNotReadKey = e {
-                    reject_auth_request(until, &mut self.write, auth_request).await;
+                    reject_auth_request(until, &mut self.main_writer.write, auth_request).await;
                     Ok(())
                 } else {
                     Err(crate::Error::from(e).into())
@@ -998,14 +998,14 @@ impl Session {
                             .await?;
                         if let Some(ref mut enc) = self.common.encrypted {
                             if result {
-                                push_packet!(enc.write, {
-                                    enc.write.push(msg::REQUEST_SUCCESS);
+                                push_packet!(enc.main_writer.write, {
+                                    enc.main_writer.write.push(msg::REQUEST_SUCCESS);
                                     if self.common.wants_reply && port == 0 && returned_port != 0 {
-                                        enc.write.push_u32_be(returned_port);
+                                        enc.main_writer.write.push_u32_be(returned_port);
                                     }
                                 })
                             } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                                push_packet!(enc.main_writer.write, enc.main_writer.write.push(msg::REQUEST_FAILURE))
                             }
                         }
                         Ok(())
@@ -1019,17 +1019,17 @@ impl Session {
                         let result = handler.cancel_tcpip_forward(address, port, self).await?;
                         if let Some(ref mut enc) = self.common.encrypted {
                             if result {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_SUCCESS))
+                                push_packet!(enc.main_writer.write, enc.main_writer.write.push(msg::REQUEST_SUCCESS))
                             } else {
-                                push_packet!(enc.write, enc.write.push(msg::REQUEST_FAILURE))
+                                push_packet!(enc.main_writer.write, enc.main_writer.write.push(msg::REQUEST_FAILURE))
                             }
                         }
                         Ok(())
                     }
                     _ => {
                         if let Some(ref mut enc) = self.common.encrypted {
-                            push_packet!(enc.write, {
-                                enc.write.push(msg::REQUEST_FAILURE);
+                            push_packet!(enc.main_writer.write, {
+                                enc.main_writer.write.push(msg::REQUEST_FAILURE);
                             });
                         }
                         Ok(())
@@ -1126,6 +1126,7 @@ impl Session {
         handler: &mut H,
         buf: &[u8],
     ) -> Result<bool, H::Error> {
+  
         let mut r = buf.reader(1);
         let msg = OpenChannelMessage::parse(&mut r)?;
 
@@ -1149,6 +1150,12 @@ impl Session {
             pending_data: std::collections::VecDeque::new(),
             pending_eof: false,
             pending_close: false,
+            writer: CryptoWriter {
+                write: CryptoVec::new(),
+                write_cursor: 0,
+                compress_buffer: CryptoVec::new()
+            },
+            write_buffer: SSHBuffer::new()
         };
 
         let (channel, reference) = Channel::new(
@@ -1161,6 +1168,22 @@ impl Session {
         match &msg.typ {
             ChannelType::Session => {
                 let mut result = handler.channel_open_session(channel, self).await;
+
+                //Check if a substream is wanted for this channel
+                if let Ok(Some(mut sub_stream)) = handler.open_channel_stream(sender_channel.clone()).await {
+                    
+                    _ = sub_stream.write(b"ack").await;
+                    let (read,write) = SshRead::new(sub_stream).split();
+
+                    let mut opening_cipher = Box::new(clear::Key) as Box<dyn OpeningKey + Send>;
+                    std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
+
+                    let r = start_reading(read, self.common.read_buffer.clone(), opening_cipher);
+                    let r = Box::pin(r);
+                    self.channel_reads.push(r);
+                    self.channel_streams.insert(sender_channel.clone(), write);
+                }
+                
                 if let Ok(allowed) = &mut result {
                     self.channels.insert(sender_channel, reference);
                     self.finalize_channel_open(&msg, channel_params, *allowed);
@@ -1217,7 +1240,7 @@ impl Session {
             ChannelType::AgentForward => {
                 if let Some(ref mut enc) = self.common.encrypted {
                     msg.fail(
-                        &mut enc.write,
+                        &mut enc.main_writer.write,
                         msg::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
                         b"Unsupported channel type",
                     );
@@ -1227,7 +1250,7 @@ impl Session {
             ChannelType::Unknown { typ } => {
                 debug!("unknown channel type: {}", String::from_utf8_lossy(typ));
                 if let Some(ref mut enc) = self.common.encrypted {
-                    msg.unknown_type(&mut enc.write);
+                    msg.unknown_type(&mut enc.main_writer.write);
                 }
                 Ok(false)
             }
@@ -1243,7 +1266,7 @@ impl Session {
         if let Some(ref mut enc) = self.common.encrypted {
             if allowed {
                 open.confirm(
-                    &mut enc.write,
+                    &mut enc.main_writer.write,
                     channel.sender_channel.0,
                     channel.sender_window_size,
                     channel.sender_maximum_packet_size,
@@ -1251,7 +1274,7 @@ impl Session {
                 enc.channels.insert(channel.sender_channel, channel);
             } else {
                 open.fail(
-                    &mut enc.write,
+                    &mut enc.main_writer.write,
                     SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
                     b"Rejected",
                 );

@@ -20,6 +20,7 @@ use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::num::Wrapping;
+use std::sync::Arc;
 
 use aes::{Aes128, Aes192, Aes256};
 use byteorder::{BigEndian, ByteOrder};
@@ -28,6 +29,7 @@ use ctr::Ctr128BE;
 use log::debug;
 use once_cell::sync::Lazy;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::Mutex;
 
 use crate::mac::MacAlgorithm;
 use crate::sshbuffer::SSHBuffer;
@@ -226,13 +228,23 @@ pub(crate) trait SealingKey {
 
 pub(crate) async fn read<'a, R: AsyncRead + Unpin>(
     stream: &'a mut R,
-    buffer: &'a mut SSHBuffer,
+    buffer_guard: Arc<Mutex<SSHBuffer>>,
     cipher: &'a mut (dyn OpeningKey + Send),
 ) -> Result<usize, Error> {
-    if buffer.len == 0 {
+    let mut buffer_len: usize = {
+        let mut buffer = buffer_guard.lock().await;
+        buffer.buffer.clear();
+        buffer.len
+    };
+
+    if buffer_len == 0 {
         let mut len = vec![0; cipher.packet_length_to_read_for_block_length()];
 
         stream.read_exact(&mut len).await?;
+
+        //Locking it after the read to avoid deadlocks
+        let mut buffer = buffer_guard.lock().await;
+        
         debug!("reading, len = {:?}", len);
         {
             let seqn = buffer.seqn.0;
@@ -245,7 +257,12 @@ pub(crate) async fn read<'a, R: AsyncRead + Unpin>(
         }
     }
 
-    buffer.buffer.resize(buffer.len + 4);
+    let mut buffer = buffer_guard.lock().await;
+
+    buffer_len = buffer.len;
+
+    buffer.buffer.resize(buffer_len + 4);
+    
     debug!("read_exact {:?}", buffer.len + 4);
     #[allow(clippy::indexing_slicing)] // length checked
     stream

@@ -30,6 +30,7 @@
 
 use std;
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::num::Wrapping;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -37,11 +38,14 @@ use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use futures::future::Future;
+use futures::stream::FuturesUnordered;
 use log::{debug, error};
 use russh_keys::key;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::tcp::ReadHalf;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::pin;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::cipher::{clear, CipherPair, OpeningKey};
@@ -54,6 +58,8 @@ mod kex;
 mod session;
 pub use self::session::*;
 mod encrypted;
+
+
 
 #[derive(Debug)]
 /// Configuration of a server.
@@ -250,6 +256,8 @@ pub trait Handler: Sized {
         Ok(())
     }
 
+    //async fn poll_stream_read(&mut self, )
+
     /// Called when the client closes a channel.
     #[allow(unused_variables)]
     async fn channel_close(
@@ -279,6 +287,12 @@ pub trait Handler: Sized {
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
         Ok(false)
+    }
+
+    async fn open_channel_stream(&mut self, 
+        channel: ChannelId) 
+        -> Result<Option<Box<dyn SubStream>>, Self::Error> {
+        Ok(None)
     }
 
     /// Called when a new X11 channel is created.
@@ -610,11 +624,11 @@ thread_local! {
 
 async fn start_reading<R: AsyncRead + Unpin>(
     mut stream_read: R,
-    mut buffer: SSHBuffer,
+    mut buffer: Arc<Mutex<SSHBuffer>>,
     mut cipher: Box<dyn OpeningKey + Send>,
-) -> Result<(usize, R, SSHBuffer, Box<dyn OpeningKey + Send>), Error> {
-    buffer.buffer.clear();
-    let n = cipher::read(&mut stream_read, &mut buffer, &mut *cipher).await?;
+) -> Result<(usize, R, Arc<Mutex<SSHBuffer>>, Box<dyn OpeningKey + Send>), Error> {
+    
+    let n = cipher::read(&mut stream_read, buffer.clone(), &mut *cipher).await?;
     Ok((n, stream_read, buffer, cipher))
 }
 
@@ -679,6 +693,8 @@ where
         pending_len: 0,
         channels: HashMap::new(),
         open_global_requests: VecDeque::new(),
+        channel_streams: HashMap::new(),
+        channel_reads: FuturesUnordered::new()
     };
     let join = tokio::spawn(session.run(stream, handler));
 
@@ -718,6 +734,7 @@ async fn read_ssh_id<R: AsyncRead + Unpin>(
     )?;
     Ok(CommonSession {
         write_buffer,
+        read_buffer: Arc::new(Mutex::new(SSHBuffer::new())),
         kex: Some(Kex::Init(kexinit)),
         auth_user: String::new(),
         auth_method: None, // Client only.
@@ -732,6 +749,7 @@ async fn read_ssh_id<R: AsyncRead + Unpin>(
         alive_timeouts: 0,
         received_data: false,
         remote_sshid: sshid.into(),
+        channel_buffers: HashMap::new()
     })
 }
 

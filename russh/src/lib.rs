@@ -95,7 +95,11 @@ use std::fmt::{Debug, Display, Formatter};
 use log::debug;
 use parsing::ChannelOpenConfirmation;
 pub use russh_cryptovec::CryptoVec;
+use session::CryptoWriter;
+use sshbuffer::SSHBuffer;
 use thiserror::Error;
+use tokio::io::{AsyncWrite, AsyncRead};
+
 
 #[cfg(test)]
 mod tests;
@@ -151,6 +155,7 @@ pub mod server;
 
 /// Client side of this library.
 pub mod client;
+
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -503,6 +508,8 @@ impl Display for ChannelId {
     }
 }
 
+pub trait SubStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+
 /// The parameters of a channel.
 #[derive(Debug)]
 pub(crate) struct ChannelParams {
@@ -518,6 +525,8 @@ pub(crate) struct ChannelParams {
     pending_data: std::collections::VecDeque<(CryptoVec, Option<u32>, usize)>,
     pending_eof: bool,
     pending_close: bool,
+    writer: CryptoWriter,
+    write_buffer: SSHBuffer
 }
 
 impl ChannelParams {

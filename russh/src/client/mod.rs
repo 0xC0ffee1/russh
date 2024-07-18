@@ -34,6 +34,7 @@
 //!
 //! [Session]: client::Session
 
+use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
@@ -42,8 +43,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::future::{select_all, OptionFuture};
+use futures::stream::FuturesUnordered;
 use futures::task::{Context, Poll};
-use futures::Future;
+use futures::{Future, StreamExt};
 use log::{debug, error, info, trace};
 use russh_cryptovec::CryptoVec;
 use russh_keys::encoding::Reader;
@@ -68,13 +71,15 @@ use crate::session::{
 use crate::ssh_read::SshRead;
 use crate::sshbuffer::{SSHBuffer, SshId};
 use crate::{
-    auth, msg, negotiation, strict_kex_violation, ChannelId, ChannelOpenFailure, Disconnect,
-    Limits, Sig,
+    auth, msg, negotiation, strict_kex_violation, ChannelId, ChannelOpenFailure, ChannelParams, Disconnect, Limits, Sig, SubStream
 };
 
 mod encrypted;
 mod kex;
 mod session;
+
+pub(crate) type ChannelReadFuture<R> = Pin<Box<dyn Future<Output = Result<(usize, SshRead<ReadHalf<R>>, Arc<Mutex<SSHBuffer>>, Box<dyn OpeningKey + Send>), crate::Error>> + Send>>;
+
 
 /// Actual client session's state.
 ///
@@ -92,6 +97,8 @@ pub struct Session {
     inbound_channel_sender: Sender<Msg>,
     inbound_channel_receiver: Receiver<Msg>,
     open_global_requests: VecDeque<GlobalRequestResponse>,
+    channel_streams: HashMap<ChannelId, WriteHalf<Box<dyn SubStream>>>,
+    channel_reads: FuturesUnordered<ChannelReadFuture<Box<dyn SubStream>>>,
 }
 
 const STRICT_KEX_MSG_ORDER: &[u8] = &[msg::KEXINIT, msg::KEX_ECDH_REPLY, msg::NEWKEYS];
@@ -699,6 +706,7 @@ where
         config.window_size,
         CommonSession {
             write_buffer,
+            read_buffer: Arc::new(Mutex::new(SSHBuffer::new())),
             kex: None,
             auth_user: String::new(),
             auth_attempts: 0,
@@ -716,6 +724,7 @@ where
             alive_timeouts: 0,
             received_data: false,
             remote_sshid: sshid.into(),
+            channel_buffers: HashMap::new()
         },
         session_receiver,
         session_sender,
@@ -738,11 +747,10 @@ where
 
 async fn start_reading<R: AsyncRead + Unpin>(
     mut stream_read: R,
-    mut buffer: SSHBuffer,
+    mut buffer: Arc<Mutex<SSHBuffer>>,
     mut cipher: Box<dyn OpeningKey + Send>,
-) -> Result<(usize, R, SSHBuffer, Box<dyn OpeningKey + Send>), crate::Error> {
-    buffer.buffer.clear();
-    let n = cipher::read(&mut stream_read, &mut buffer, &mut *cipher).await?;
+) -> Result<(usize, R, Arc<Mutex<SSHBuffer>>, Box<dyn OpeningKey + Send>), crate::Error> {
+    let n = cipher::read(&mut stream_read, buffer.clone(), &mut *cipher).await?;
     Ok((n, stream_read, buffer, cipher))
 }
 
@@ -765,6 +773,8 @@ impl Session {
             pending_reads: Vec::new(),
             pending_len: 0,
             open_global_requests: VecDeque::new(),
+            channel_streams: HashMap::new(),
+            channel_reads: FuturesUnordered::new(),
         }
     }
 
@@ -823,8 +833,6 @@ impl Session {
         self.common.write_buffer.buffer.clear();
         let mut decomp = CryptoVec::new();
 
-        let buffer = SSHBuffer::new();
-
         // Allow handing out references to the cipher
         let mut opening_cipher = Box::new(clear::Key) as Box<dyn OpeningKey + Send>;
         std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
@@ -837,20 +845,23 @@ impl Session {
             crate::future_or_pending(self.common.config.inactivity_timeout, tokio::time::sleep);
         pin!(inactivity_timer);
 
-        let reading = start_reading(stream_read, buffer, opening_cipher);
+        
+        let reading = start_reading(stream_read, self.common.read_buffer.clone(), opening_cipher);
         pin!(reading);
 
         #[allow(clippy::panic)] // false positive in select! macro
         while !self.common.disconnected {
             self.common.received_data = false;
             let mut sent_keepalive = false;
+
             tokio::select! {
                 r = &mut reading => {
-                    let (stream_read, mut buffer, mut opening_cipher) = match r {
-                        Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
+                    let (stream_read, mut buffer_guard, mut opening_cipher) = match r {
+                        Ok((_, stream_read, buffer_guard, opening_cipher)) => (stream_read, buffer_guard, opening_cipher),
                         Err(e) => return Err(e.into())
                     };
-
+                    let mut buffer = buffer_guard.lock().await;
+                    
                     std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
 
                     if buffer.buffer.len() < 5 {
@@ -877,12 +888,64 @@ impl Session {
                             result = self.process_disconnect(buf);
                         } else {
                             self.common.received_data = true;
-                            reply( self,handler, &mut encrypted_signal, &mut buffer.seqn, buf).await?;
+
+                            //Figure out a better way to do this, probably just do what the comment below says
+                            let mut vec = vec![0; buf.len()];
+                            vec.copy_from_slice(buf);
+
+                            reply( self,handler, &mut encrypted_signal, &mut buffer.seqn, &vec).await?;
                         }
                     }
 
                     std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
-                    reading.set(start_reading(stream_read, buffer, opening_cipher));
+                    reading.set(start_reading(stream_read, buffer_guard.clone(), opening_cipher));
+                }
+                Some(opt_r) = self.channel_reads.next() => { 
+                    log::info!("Checking futures!");
+                    let (stream_read, mut buffer_guard, mut opening_cipher) = match opt_r {
+                        Ok((_, stream_read, buffer_guard, opening_cipher)) => (stream_read, buffer_guard, opening_cipher),
+                        Err(e) => return Err(e.into())
+                    };
+                    let mut buffer = buffer_guard.lock().await;
+                    std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
+                    if buffer.buffer.len() < 5 {
+                        break
+                    }
+
+                    let buf = if let Some(ref mut enc) = self.common.encrypted {
+                        #[allow(clippy::indexing_slicing)] // length checked
+                        if let Ok(buf) = enc.decompress.decompress(
+                            &buffer.buffer[5..],
+                            &mut decomp,
+                        ) {
+                            buf
+                        } else {
+                            break
+                        }
+                    } else {
+                        #[allow(clippy::indexing_slicing)] // length checked
+                        &buffer.buffer[5..]
+                    };
+                    if !buf.is_empty() {
+                        #[allow(clippy::indexing_slicing)] // length checked
+                        if buf[0] == crate::msg::DISCONNECT {
+                            result = self.process_disconnect(buf);
+                        } else {
+                            self.common.received_data = true;
+
+                            //Figure out a better way to do this, probably just do what the comment below says
+                            let mut vec = vec![0; buf.len()];
+                            vec.copy_from_slice(buf);
+
+                            reply( self,handler, &mut encrypted_signal, &mut buffer.seqn, &vec).await?;
+                        }
+                    }
+
+                    std::mem::swap(&mut opening_cipher, &mut self.common.cipher.remote_to_local);
+
+
+                    let new_future = start_reading(stream_read, buffer_guard.clone(), opening_cipher);
+                    self.channel_reads.push(Box::pin(new_future));
                 }
                 () = &mut keepalive_timer => {
                     if self.common.config.keepalive_max != 0 && self.common.alive_timeouts > self.common.config.keepalive_max {
@@ -931,6 +994,7 @@ impl Session {
             };
 
             self.flush()?;
+            
             if !self.common.write_buffer.buffer.is_empty() {
                 trace!(
                     "writing to stream: {:?} bytes",
@@ -940,15 +1004,37 @@ impl Session {
                     .write_all(&self.common.write_buffer.buffer)
                     .await
                     .map_err(crate::Error::from)?;
-                stream_write.flush().await.map_err(crate::Error::from)?;
+
             }
             self.common.write_buffer.buffer.clear();
+
             if let Some(ref mut enc) = self.common.encrypted {
                 if let EncryptedState::InitCompression = enc.state {
                     enc.client_compression.init_compress(&mut enc.compress);
                     enc.state = EncryptedState::Authenticated;
                 }
+                let channels: Vec<_> = enc.channels.keys().cloned().collect();
+
+                for id in channels {
+                    let _ = enc.flush_channel_test(&id, &self.common.config.as_ref().limits, &mut *self.common.cipher.local_to_remote, &mut self.common.write_buffer);
+                    log::info!(
+                        "writing to CHANNEL stream: {:?} bytes",
+                        self.common.write_buffer.buffer.len()
+                    );
+                    if let Some(sub_write) = self.channel_streams.get_mut(&id){
+                        sub_write
+                        .write_all(&self.common.write_buffer.buffer)
+                        .await
+                        .map_err(crate::Error::from)?;
+
+
+                        sub_write.flush().await.map_err(crate::Error::from)?;
+
+                        self.common.write_buffer.buffer.clear();
+                    }
+                }
             }
+            stream_write.flush().await.map_err(crate::Error::from)?;
 
             if self.common.received_data {
                 // Reset the number of failed keepalive attempts. We don't
@@ -1177,6 +1263,8 @@ impl Session {
         self.common.kex = Some(Kex::Init(kexinit));
         Ok(())
     }
+
+
 
     /// Flush the temporary cleartext buffer into the encryption
     /// buffer. This does *not* flush to the socket.
@@ -1484,6 +1572,12 @@ pub trait Handler: Sized + Send {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    async fn channel_accept_stream(&mut self, 
+        id: ChannelId) -> Result<Option<Box<dyn SubStream>>, Self::Error> {
+
+        Ok(None)
     }
 
     /// Called when the server signals success.

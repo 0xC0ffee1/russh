@@ -17,6 +17,7 @@ use std::num::Wrapping;
 
 use super::*;
 
+
 /// The SSH client/server identification string.
 #[derive(Debug)]
 pub enum SshId {
