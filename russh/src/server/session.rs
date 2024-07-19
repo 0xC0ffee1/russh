@@ -30,6 +30,7 @@ pub struct Session {
     pub(crate) open_global_requests: VecDeque<GlobalRequestResponse>,
     pub(crate) channel_streams: HashMap<ChannelId, WriteHalf<Box<dyn SubStream>>>,
     pub(crate) channel_reads: FuturesUnordered<ChannelReadFuture<Box<dyn SubStream>>>,
+    pub(crate) opening_key: Arc<Mutex<Box<dyn OpeningKey + Send>>>
 }
 
 #[derive(Debug)]
@@ -468,7 +469,7 @@ impl Session {
                             //Figure out a better way to do this, probably just do what the comment below says
                             let mut vec = vec![0; buf.len()];
                             vec.copy_from_slice(buf);
-
+                            
                             // TODO it'd be cleaner to just pass cipher to reply()
                             match reply(&mut self, &mut handler, &mut buffer.seqn, &vec).await {
                                 Ok(_) => {},

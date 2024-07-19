@@ -694,7 +694,8 @@ where
         channels: HashMap::new(),
         open_global_requests: VecDeque::new(),
         channel_streams: HashMap::new(),
-        channel_reads: FuturesUnordered::new()
+        channel_reads: FuturesUnordered::new(),
+        opening_key: Arc::new(Mutex::new(Box::new(clear::Key)))
     };
     let join = tokio::spawn(session.run(stream, handler));
 
