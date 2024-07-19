@@ -87,7 +87,7 @@ impl Session {
                         self.common.cipher.local_to_remote.clone(),
                         buf,
                         &mut self.common.write_buffer,
-                    )?;
+                    ).await?;
 
                     if !enc.kex.skip_exchange() {
                         enc.rekey = Some(Kex::DhDone(dhdone));
@@ -96,7 +96,7 @@ impl Session {
             } else {
                 unreachable!()
             }
-            self.flush()?;
+            self.flush().await?;
             return Ok(());
         }
 
@@ -117,7 +117,7 @@ impl Session {
                             .lock()
                             .await
                             .write(&[msg::NEWKEYS], &mut self.common.write_buffer);
-                        self.flush()?;
+                        self.flush().await?;
                         self.common.maybe_reset_seqn();
                         Ok(())
                     } else {
@@ -140,8 +140,8 @@ impl Session {
                     }
                     self.pending_reads = pending;
                     self.pending_len = 0;
-                    self.common.newkeys(newkeys);
-                    self.flush()?;
+                    self.common.newkeys(newkeys).await;
+                    self.flush().await?;
 
                     if self.common.strict_kex {
                         *seqn = Wrapping(0);
@@ -926,7 +926,7 @@ impl Session {
         channel
     }
 
-    pub(crate) fn write_auth_request_if_needed(&mut self, user: &str, meth: auth::Method) -> bool {
+    pub(crate) async fn write_auth_request_if_needed(&mut self, user: &str, meth: auth::Method) -> bool {
         let mut is_waiting = false;
         if let Some(ref mut enc) = self.common.encrypted {
             is_waiting = match enc.state {
@@ -941,7 +941,8 @@ impl Session {
                         self.common
                             .cipher
                             .local_to_remote
-                            .blocking_lock()
+                            .lock()
+                            .await
                             .write(p, &mut self.common.write_buffer);
                         *sent = true
                     }

@@ -15,7 +15,7 @@ thread_local! {
 }
 
 impl KexInit {
-    pub fn server_parse(
+    pub async fn server_parse(
         mut self,
         config: &Config,
         cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
@@ -29,7 +29,7 @@ impl KexInit {
                 super::negotiation::Server::read_kex(buf, &config.preferred, Some(&config.keys))?
             };
             if !self.sent {
-                self.server_write(config, cipher, write_buffer)?
+                self.server_write(config, cipher, write_buffer).await?
             }
             let mut key = 0;
             #[allow(clippy::indexing_slicing)] // length checked
@@ -54,7 +54,7 @@ impl KexInit {
         }
     }
 
-    pub fn server_write(
+    pub async fn server_write(
         &mut self,
         config: &Config,
         cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
@@ -68,13 +68,13 @@ impl KexInit {
         )?;
         debug!("server kex init: {:?}", &self.exchange.server_kex_init[..]);
         self.sent = true;
-        cipher.blocking_lock().write(&self.exchange.server_kex_init, write_buffer);
+        cipher.lock().await.write(&self.exchange.server_kex_init, write_buffer);
         Ok(())
     }
 }
 
 impl KexDh {
-    pub fn parse(
+    pub async fn parse(
         mut self,
         config: &Config,
         cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
@@ -104,6 +104,9 @@ impl KexDh {
                 names: self.names,
                 session_id: self.session_id,
             };
+
+            let mut cipher_guard = cipher.lock().await;
+
             #[allow(clippy::indexing_slicing)] // key index checked
             let hash: Result<_, Error> = HASH_BUF.with(|buffer| {
                 let mut buffer = buffer.borrow_mut();
@@ -129,9 +132,8 @@ impl KexDh {
                 debug!("hash: {:?}", hash);
                 debug!("key: {:?}", config.keys[kexdhdone.key]);
                 config.keys[kexdhdone.key].add_signature(&mut buffer, &hash)?;
-                let mut cipher = cipher.blocking_lock();
-                cipher.write(&buffer, write_buffer);
-                cipher.write(&[msg::NEWKEYS], write_buffer);
+                cipher_guard.write(&buffer, write_buffer);
+                cipher_guard.write(&[msg::NEWKEYS], write_buffer);
                 Ok(hash)
             });
 

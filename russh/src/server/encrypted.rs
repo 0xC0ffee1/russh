@@ -57,7 +57,7 @@ impl Session {
                     self.common.cipher.local_to_remote.clone(),
                     buf,
                     &mut self.common.write_buffer,
-                )?);
+                ).await?);
             } else if let Some(exchange) = enc.exchange.take() {
                 let kexinit = KexInit::received_rekey(
                     exchange,
@@ -73,12 +73,12 @@ impl Session {
                     self.common.cipher.local_to_remote.clone(),
                     buf,
                     &mut self.common.write_buffer,
-                )?);
+                ).await?);
             }
             if let Some(Kex::Dh(KexDh { ref names, .. })) = enc.rekey {
                 self.common.strict_kex = self.common.strict_kex || names.strict_kex;
             }
-            self.flush()?;
+            self.flush().await?;
             return Ok(());
         }
 
@@ -89,12 +89,12 @@ impl Session {
                     self.common.cipher.local_to_remote.clone(),
                     buf,
                     &mut self.common.write_buffer,
-                )?);
+                ).await?);
                 if let Some(Kex::Keys(_)) = enc.rekey {
                     // just sent NEWKEYS
                     self.common.maybe_reset_seqn();
                 }
-                self.flush()?;
+                self.flush().await?;
                 return Ok(());
             }
             Some(Kex::Keys(newkeys)) => {
@@ -112,11 +112,11 @@ impl Session {
                 }
                 self.pending_reads = pending;
                 self.pending_len = 0;
-                self.common.newkeys(newkeys);
+                self.common.newkeys(newkeys).await;
                 if self.common.strict_kex {
                     *seqn = Wrapping(0);
                 }
-                self.flush()?;
+                self.flush().await?;
                 return Ok(());
             }
             Some(Kex::Init(k)) => {
@@ -680,7 +680,7 @@ impl Session {
                         }
                     }
                 }
-                self.flush()?;
+                self.flush().await?;
                 if let Some(ext) = ext {
                     if let Some(chan) = self.channels.get(&channel_num) {
                         chan.send(ChannelMsg::ExtendedData {
@@ -1178,6 +1178,7 @@ impl Session {
                     let r = start_reading(read, self.common.read_buffer.clone(), self.common.cipher.remote_to_local.clone());
                     let r = Box::pin(r);
                     self.channel_reads.push(r);
+                    info!("Opened channel bi stream!");
                     self.channel_streams.insert(sender_channel.clone(), write);
                 }
                 

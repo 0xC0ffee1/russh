@@ -729,7 +729,7 @@ where
         session_receiver,
         session_sender,
     );
-    session.read_ssh_id(sshid)?;
+    session.read_ssh_id(sshid).await?;
     let (encrypted_signal, encrypted_recv) = tokio::sync::oneshot::channel();
     let join = tokio::spawn(session.run(stream, handler, Some(encrypted_signal)));
 
@@ -821,7 +821,7 @@ impl Session {
     ) -> Result<RemoteDisconnectInfo, H::Error> {
         let mut result: Result<RemoteDisconnectInfo, H::Error> =
             Err(crate::Error::Disconnect.into());
-        self.flush()?;
+        self.flush().await?;
         if !self.common.write_buffer.buffer.is_empty() {
             debug!("writing {:?} bytes", self.common.write_buffer.buffer.len());
             stream_write
@@ -950,7 +950,7 @@ impl Session {
                 }
                 msg = self.receiver.recv(), if !self.is_rekeying() => {
                     match msg {
-                        Some(msg) => self.handle_msg(msg)?,
+                        Some(msg) => self.handle_msg(msg).await?,
                         None => {
                             self.common.disconnected = true;
                             break
@@ -960,28 +960,28 @@ impl Session {
                     // eagerly take all outgoing messages so writes are batched
                     while !self.is_rekeying() {
                         match self.receiver.try_recv() {
-                            Ok(next) => self.handle_msg(next)?,
+                            Ok(next) => self.handle_msg(next).await?,
                             Err(_) => break
                         }
                     }
                 }
                 msg = self.inbound_channel_receiver.recv(), if !self.is_rekeying() => {
                     match msg {
-                        Some(msg) => self.handle_msg(msg)?,
+                        Some(msg) => self.handle_msg(msg).await?,
                         None => (),
                     }
 
                     // eagerly take all outgoing messages so writes are batched
                     while !self.is_rekeying() {
                         match self.inbound_channel_receiver.try_recv() {
-                            Ok(next) => self.handle_msg(next)?,
+                            Ok(next) => self.handle_msg(next).await?,
                             Err(_) => break
                         }
                     }
                 }
             };
 
-            self.flush()?;
+            self.flush().await?;
             
             if !self.common.write_buffer.buffer.is_empty() {
                 trace!(
@@ -992,8 +992,8 @@ impl Session {
                     .write_all(&self.common.write_buffer.buffer)
                     .await
                     .map_err(crate::Error::from)?;
-
             }
+
             self.common.write_buffer.buffer.clear();
 
             if let Some(ref mut enc) = self.common.encrypted {
@@ -1004,7 +1004,7 @@ impl Session {
                 let channels: Vec<_> = enc.channels.keys().cloned().collect();
 
                 for id in channels {
-                    let _ = enc.flush_channel_test(&id, &self.common.config.as_ref().limits, self.common.cipher.local_to_remote.clone(), &mut self.common.write_buffer);
+                    let _ = enc.flush_channel_test(&id, &self.common.config.as_ref().limits, self.common.cipher.local_to_remote.clone(), &mut self.common.write_buffer).await;
                     log::info!(
                         "writing to CHANNEL stream: {:?} bytes",
                         self.common.write_buffer.buffer.len()
@@ -1014,7 +1014,6 @@ impl Session {
                         .write_all(&self.common.write_buffer.buffer)
                         .await
                         .map_err(crate::Error::from)?;
-
 
                         sub_write.flush().await.map_err(crate::Error::from)?;
 
@@ -1075,10 +1074,10 @@ impl Session {
         })
     }
 
-    fn handle_msg(&mut self, msg: Msg) -> Result<(), crate::Error> {
+    async fn handle_msg(&mut self, msg: Msg) -> Result<(), crate::Error> {
         match msg {
             Msg::Authenticate { user, method } => {
-                self.write_auth_request_if_needed(&user, method);
+                self.write_auth_request_if_needed(&user, method).await;
             }
             Msg::Signed { .. } => {}
             Msg::AuthInfoResponse { .. } => {}
@@ -1228,7 +1227,7 @@ impl Session {
         }
     }
 
-    fn read_ssh_id(&mut self, sshid: &[u8]) -> Result<(), crate::Error> {
+    async fn read_ssh_id(&mut self, sshid: &[u8]) -> Result<(), crate::Error> {
         // self.read_buffer.bytes += sshid.bytes_read + 2;
         let mut exchange = Exchange::new();
         exchange.server_id.extend(sshid);
@@ -1247,7 +1246,7 @@ impl Session {
             self.common.config.as_ref(),
             self.common.cipher.local_to_remote.clone(),
             &mut self.common.write_buffer,
-        )?;
+        ).await?;
         self.common.kex = Some(Kex::Init(kexinit));
         Ok(())
     }
@@ -1256,13 +1255,13 @@ impl Session {
 
     /// Flush the temporary cleartext buffer into the encryption
     /// buffer. This does *not* flush to the socket.
-    fn flush(&mut self) -> Result<(), crate::Error> {
+    async fn flush(&mut self) -> Result<(), crate::Error> {
         if let Some(ref mut enc) = self.common.encrypted {
             if enc.flush(
                 &self.common.config.as_ref().limits,
                 self.common.cipher.local_to_remote.clone(),
                 &mut self.common.write_buffer,
-            )? {
+            ).await? {
                 info!("Re-exchanging keys");
                 if enc.rekey.is_none() {
                     if let Some(exchange) = enc.exchange.take() {
@@ -1271,7 +1270,7 @@ impl Session {
                             self.common.config.as_ref(),
                             self.common.cipher.local_to_remote.clone(),
                             &mut self.common.write_buffer,
-                        )?;
+                        ).await?;
                         enc.rekey = Some(Kex::Init(kexinit))
                     }
                 }
@@ -1390,7 +1389,7 @@ async fn reply<H: Handler>(
                     session.common.cipher.local_to_remote.clone(),
                     buf,
                     &mut session.common.write_buffer,
-                )?;
+                ).await?;
 
                 // seqno has already been incremented after read()
                 if done.names.strict_kex && seqn.0 != 1 {
@@ -1401,7 +1400,7 @@ async fn reply<H: Handler>(
                     session.common.encrypted(
                         initial_encrypted_state(session),
                         done.compute_keys(CryptoVec::new(), false)?,
-                    );
+                    ).await;
 
                     if let Some(sender) = sender.take() {
                         sender.send(()).unwrap_or(());
@@ -1409,7 +1408,7 @@ async fn reply<H: Handler>(
                 } else {
                     session.common.kex = Some(Kex::DhDone(done));
                 }
-                session.flush()?;
+                session.flush().await?;
             }
             Ok(())
         }
@@ -1430,7 +1429,7 @@ async fn reply<H: Handler>(
                     .lock()
                     .await
                     .write(&[msg::NEWKEYS], &mut session.common.write_buffer);
-                session.flush()?;
+                session.flush().await?;
                 session.common.maybe_reset_seqn();
                 Ok(())
             } else {
@@ -1448,7 +1447,7 @@ async fn reply<H: Handler>(
             }
             session
                 .common
-                .encrypted(initial_encrypted_state(session), newkeys);
+                .encrypted(initial_encrypted_state(session), newkeys).await;
             // Ok, NEWKEYS received, now encrypted.
             if session.common.strict_kex {
                 *seqn = Wrapping(0);

@@ -157,11 +157,23 @@ pub(crate) struct CipherPair {
     pub remote_to_local: Arc<Mutex<Box<dyn OpeningKey + Send>>>,
 }
 
+pub(crate) struct CipherPairTemp {
+    pub local_to_remote: Box<dyn SealingKey + Send>,
+    pub remote_to_local: Box<dyn OpeningKey + Send>,
+}
+
 impl Debug for CipherPair {
     fn fmt(&self, _: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         Ok(())
     }
 }
+
+impl Debug for CipherPairTemp {
+    fn fmt(&self, _: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        Ok(())
+    }
+}
+
 
 pub(crate) trait OpeningKey {
     fn packet_length_to_read_for_block_length(&self) -> usize {
@@ -232,6 +244,7 @@ pub(crate) async fn read<'a, R: AsyncRead + Unpin>(
     cipher_guard: Arc<Mutex<Box<dyn OpeningKey + Send>>>,
 ) -> Result<usize, Error> {
     let mut buffer_len: usize = {
+        log::info!("Waiting buffer guard lock!");
         let mut buffer = buffer_guard.lock().await;
         buffer.buffer.clear();
         buffer.len
@@ -239,11 +252,14 @@ pub(crate) async fn read<'a, R: AsyncRead + Unpin>(
 
     if buffer_len == 0 {
         let mut len = {
+            log::info!("Waiting cipher guard lock!");
             let cipher = cipher_guard.lock().await;
             vec![0; cipher.packet_length_to_read_for_block_length()]
         };
 
+        log::info!("Now reading stream!");
         stream.read_exact(&mut len).await?;
+        log::info!("Stream has been read!");
 
         //Locking it after the read to avoid deadlocks
         let mut buffer = buffer_guard.lock().await;

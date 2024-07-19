@@ -214,7 +214,7 @@ impl<D: Digest> KexAlgorithm for DhGroupKex<D> {
         remote_to_local_mac: mac::Name,
         local_to_remote_mac: mac::Name,
         is_server: bool,
-    ) -> Result<super::cipher::CipherPair, crate::Error> {
+    ) -> Result<super::cipher::CipherPairTemp, crate::Error> {
         compute_keys::<D>(
             self.shared_secret.as_deref(),
             session_id,

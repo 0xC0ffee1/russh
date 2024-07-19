@@ -181,7 +181,7 @@ where
         remote_to_local_mac: mac::Name,
         local_to_remote_mac: mac::Name,
         is_server: bool,
-    ) -> Result<crate::kex::cipher::CipherPair, crate::Error> {
+    ) -> Result<crate::kex::cipher::CipherPairTemp, crate::Error> {
         compute_keys::<D>(
             self.shared_secret
                 .as_ref()

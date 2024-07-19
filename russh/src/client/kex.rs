@@ -12,7 +12,7 @@ use crate::session::{KexDhDone, KexInit};
 use crate::sshbuffer::SSHBuffer;
 
 impl KexInit {
-    pub fn client_parse(
+    pub async fn client_parse(
         mut self,
         config: &Config,
         cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
@@ -30,7 +30,7 @@ impl KexInit {
         debug!("write = {:?}", &write_buffer.buffer[..]);
 
         if !self.sent {
-            self.client_write(config, cipher.clone(), write_buffer)?
+            self.client_write(config, cipher.clone(), write_buffer).await?
         }
 
         // This function is called from the public API.
@@ -53,7 +53,7 @@ impl KexInit {
         )?;
 
         #[allow(clippy::indexing_slicing)] // length checked
-        cipher.blocking_lock().write(&self.exchange.client_kex_init[i0..], write_buffer);
+        cipher.lock().await.write(&self.exchange.client_kex_init[i0..], write_buffer);
         self.exchange.client_kex_init.resize(i0);
 
         debug!("moving to kexdhdone, exchange = {:?}", self.exchange);
@@ -66,7 +66,7 @@ impl KexInit {
         })
     }
 
-    pub fn client_write(
+    pub async fn client_write(
         &mut self,
         config: &Config,
         cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
@@ -75,7 +75,7 @@ impl KexInit {
         self.exchange.client_kex_init.clear();
         negotiation::write_kex(&config.preferred, &mut self.exchange.client_kex_init, None)?;
         self.sent = true;
-        cipher.blocking_lock().write(&self.exchange.client_kex_init, write_buffer);
+        cipher.lock().await.write(&self.exchange.client_kex_init, write_buffer);
         Ok(())
     }
 }

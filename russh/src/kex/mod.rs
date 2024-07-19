@@ -79,7 +79,7 @@ pub(crate) trait KexAlgorithm {
         remote_to_local_mac: mac::Name,
         local_to_remote_mac: mac::Name,
         is_server: bool,
-    ) -> Result<super::cipher::CipherPair, crate::Error>;
+    ) -> Result<super::cipher::CipherPairTemp, crate::Error>;
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
@@ -181,7 +181,7 @@ pub(crate) fn compute_keys<D: Digest>(
     remote_to_local_mac: mac::Name,
     local_to_remote_mac: mac::Name,
     is_server: bool,
-) -> Result<super::cipher::CipherPair, crate::Error> {
+) -> Result<super::cipher::CipherPairTemp, crate::Error> {
     let cipher = CIPHERS.get(&cipher).ok_or(crate::Error::UnknownAlgo)?;
     let remote_to_local_mac = MACS
         .get(&remote_to_local_mac)
@@ -277,9 +277,9 @@ pub(crate) fn compute_keys<D: Digest>(
                     let remote_to_local =
                         cipher.make_opening_key(&key, &nonce, &mac, *remote_to_local_mac);
 
-                    Ok(super::cipher::CipherPair {
-                        local_to_remote: Arc::new(Mutex::new(local_to_remote)),
-                        remote_to_local: Arc::new(Mutex::new(remote_to_local)),
+                    Ok(super::cipher::CipherPairTemp {
+                        local_to_remote,
+                        remote_to_local,
                     })
                 })
             })

@@ -14,6 +14,7 @@
 //
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::mem;
 use std::num::Wrapping;
 use std::sync::Arc;
 
@@ -108,19 +109,25 @@ impl ChannelFlushResult {
 }
 
 impl<C> CommonSession<C> {
-    pub fn newkeys(&mut self, newkeys: NewKeys) {
+    pub async fn newkeys(&mut self, newkeys: NewKeys) {
         if let Some(ref mut enc) = self.encrypted {
             enc.exchange = Some(newkeys.exchange);
             enc.kex = newkeys.kex;
             enc.key = newkeys.key;
             enc.client_mac = newkeys.names.client_mac;
             enc.server_mac = newkeys.names.server_mac;
-            self.cipher = newkeys.cipher;
+            
+            let mut remote_to_local_guard = self.cipher.remote_to_local.lock().await;
+            *remote_to_local_guard = newkeys.cipher.remote_to_local;
+
+            let mut local_to_remote_guard = self.cipher.local_to_remote.lock().await;
+            *local_to_remote_guard = newkeys.cipher.local_to_remote;
+
             self.strict_kex = self.strict_kex || newkeys.names.strict_kex;
         }
     }
 
-    pub fn encrypted(&mut self, state: EncryptedState, newkeys: NewKeys) {
+    pub async fn encrypted(&mut self, state: EncryptedState, newkeys: NewKeys) {
         self.encrypted = Some(Encrypted {
             exchange: Some(newkeys.exchange),
             kex: newkeys.kex,
@@ -144,7 +151,13 @@ impl<C> CommonSession<C> {
             
             decompress: crate::compression::Decompress::None,
         });
-        self.cipher = newkeys.cipher;
+
+        let mut remote_to_local_guard = self.cipher.remote_to_local.lock().await;
+        *remote_to_local_guard = newkeys.cipher.remote_to_local;
+
+        let mut local_to_remote_guard = self.cipher.local_to_remote.lock().await;
+        *local_to_remote_guard = newkeys.cipher.local_to_remote;
+
         self.strict_kex = newkeys.names.strict_kex;
     }
 
@@ -405,7 +418,7 @@ impl Encrypted {
         }
     }
 
-    pub fn flush_channel_test(
+    pub async fn flush_channel_test(
         &mut self,
         id: &ChannelId,
         limits: &Limits,
@@ -431,7 +444,7 @@ impl Encrypted {
 
             #[allow(clippy::indexing_slicing)]
             let packet = self.compress.compress(to_write, &mut writer.compress_buffer)?;
-            cipher.blocking_lock().write(packet, write_buffer);
+            cipher.lock().await.write(packet, write_buffer);
             writer.write_cursor += 4 + len;
         }
 
@@ -453,7 +466,7 @@ impl Encrypted {
     }
 
 
-    pub fn flush(
+    pub async fn flush(
         &mut self,
         limits: &Limits,
         cipher: Arc<Mutex<Box<dyn SealingKey + Send>>>,
@@ -473,7 +486,7 @@ impl Encrypted {
                 let packet = self
                     .compress
                     .compress(to_write, &mut self.main_writer.compress_buffer)?;
-                cipher.blocking_lock().write(packet, write_buffer);
+                cipher.lock().await.write(packet, write_buffer);
                 self.main_writer.write_cursor += 4 + len
             }
         }
@@ -684,7 +697,7 @@ pub(crate) struct NewKeys {
     pub names: negotiation::Names,
     pub kex: Box<dyn KexAlgorithm + Send>,
     pub key: usize,
-    pub cipher: cipher::CipherPair,
+    pub cipher: cipher::CipherPairTemp,
     pub session_id: CryptoVec,
     pub sent: bool,
 }

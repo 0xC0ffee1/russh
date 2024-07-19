@@ -732,7 +732,7 @@ async fn read_ssh_id<R: AsyncRead + Unpin>(
         config.as_ref(),
         cipher.local_to_remote.clone(),
         &mut write_buffer,
-    )?;
+    ).await?;
     Ok(CommonSession {
         write_buffer,
         read_buffer: Arc::new(Mutex::new(SSHBuffer::new())),
@@ -787,7 +787,7 @@ async fn reply<H: Handler + Send>(
                         session.common.cipher.local_to_remote.clone(),
                         buf,
                         &mut session.common.write_buffer,
-                    )?);
+                    ).await?);
                     if let Some(Kex::Dh(KexDh { ref names, .. })) = session.common.kex {
                         session.common.strict_kex = names.strict_kex;
                     }
@@ -809,7 +809,7 @@ async fn reply<H: Handler + Send>(
                     session.common.cipher.local_to_remote.clone(),
                     buf,
                     &mut session.common.write_buffer,
-                )?);
+                ).await?);
                 if let Some(Kex::Keys(_)) = session.common.kex {
                     // just sent NEWKEYS
                     session.common.maybe_reset_seqn();
@@ -827,7 +827,7 @@ async fn reply<H: Handler + Send>(
                         accepted: false,
                     },
                     newkeys,
-                );
+                ).await;
                 session.maybe_send_ext_info();
                 if session.common.strict_kex {
                     *seqn = Wrapping(0);

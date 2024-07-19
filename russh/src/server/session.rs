@@ -400,7 +400,7 @@ impl Session {
         H: Handler + Send + 'static,
         R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.flush()?;
+        self.flush().await?;
         stream
             .write_all(&self.common.write_buffer.buffer)
             .await
@@ -480,6 +480,8 @@ impl Session {
                     reading.set(start_reading(stream_read, buffer_guard.clone(), opening_cipher));
                 }
                 Some(opt_r) = self.channel_reads.next() => { 
+
+                    log::info!("SERVER READING CHANNEL!");
                     let (stream_read, mut buffer_guard, mut opening_cipher) = match opt_r {
                         Ok((_, stream_read, buffer_guard, opening_cipher)) => (stream_read, buffer_guard, opening_cipher),
                         Err(e) => return Err(e.into())
@@ -611,7 +613,7 @@ impl Session {
                 }
             }
             
-            self.flush()?;
+            self.flush().await?;
             stream_write
                 .write_all(&self.common.write_buffer.buffer)
                 .await
@@ -622,7 +624,7 @@ impl Session {
                 let channels: Vec<_> = enc.channels.keys().cloned().collect();
 
                 for id in channels {
-                    let _ = enc.flush_channel_test(&id, &self.common.config.as_ref().limits, self.common.cipher.local_to_remote.clone(), &mut self.common.write_buffer);
+                    let _ = enc.flush_channel_test(&id, &self.common.config.as_ref().limits, self.common.cipher.local_to_remote.clone(), &mut self.common.write_buffer).await;
                     if self.common.write_buffer.buffer.is_empty() {continue;}
                     log::info!(
                         "writing to CHANNEL stream: {:?} bytes",
@@ -721,13 +723,13 @@ impl Session {
     }
 
     /// Flush the session, i.e. encrypt the pending buffer.
-    pub fn flush(&mut self) -> Result<(), Error> {
+    pub async fn flush(&mut self) -> Result<(), Error> {
         if let Some(ref mut enc) = self.common.encrypted {
             if enc.flush(
                 &self.common.config.as_ref().limits,
                 self.common.cipher.local_to_remote.clone(),
                 &mut self.common.write_buffer
-            )? && enc.rekey.is_none()
+            ).await? && enc.rekey.is_none()
             {
                 debug!("starting rekeying");
                 if let Some(exchange) = enc.exchange.take() {
@@ -736,7 +738,7 @@ impl Session {
                         self.common.config.as_ref(),
                         self.common.cipher.local_to_remote.clone(),
                         &mut self.common.write_buffer,
-                    )?;
+                    ).await?;
                     enc.rekey = Some(Kex::Init(kexinit))
                 }
             }
