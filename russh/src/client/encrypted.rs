@@ -406,7 +406,6 @@ impl Session {
         client: &mut H,
         buf: &[u8],
     ) -> Result<(), H::Error> {
-        info!("FIRST {}", buf.first().unwrap());
         match buf.first() {
             
             Some(&msg::CHANNEL_OPEN_CONFIRMATION) => {

@@ -440,7 +440,7 @@ impl Encrypted {
             #[allow(clippy::indexing_slicing)]
             let to_write = &writer.write[(writer.write_cursor + 4)..(writer.write_cursor + 4 + len)];
 
-            info!("CHANNEL server_write_encrypted, buf = {:?}", to_write);
+            //info!("CHANNEL server_write_encrypted, buf = {:?}", to_write);
 
             #[allow(clippy::indexing_slicing)]
             let packet = self.compress.compress(to_write, &mut writer.compress_buffer)?;
@@ -481,7 +481,7 @@ impl Encrypted {
                 let len = BigEndian::read_u32(&self.main_writer.write[self.main_writer.write_cursor..]) as usize;
                 #[allow(clippy::indexing_slicing)]
                 let to_write = &self.main_writer.write[(self.main_writer.write_cursor + 4)..(self.main_writer.write_cursor + 4 + len)];
-                info!("server_write_encrypted, buf = {:?}", to_write);
+                //info!("server_write_encrypted, buf = {:?}", to_write);
                 #[allow(clippy::indexing_slicing)]
                 let packet = self
                     .compress

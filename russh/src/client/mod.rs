@@ -1005,10 +1005,6 @@ impl Session {
 
                 for id in channels {
                     let _ = enc.flush_channel_test(&id, &self.common.config.as_ref().limits, self.common.cipher.local_to_remote.clone(), &mut self.common.write_buffer).await;
-                    log::info!(
-                        "writing to CHANNEL stream: {:?} bytes",
-                        self.common.write_buffer.buffer.len()
-                    );
                     if let Some(sub_write) = self.channel_streams.get_mut(&id){
                         sub_write
                         .write_all(&self.common.write_buffer.buffer)
